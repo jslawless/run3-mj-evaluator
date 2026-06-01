@@ -344,13 +344,17 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 out_record = {}
 
-                # Pass through all original top-level branches. The nested
-                # ScoutingPFJet record is written as a single branch so all jet
-                # fields share one nScoutingPFJet counter rather than emitting
-                # a counter per field.
+                # Pass through all original top-level branches. ak.zip rebuilds
+                # ScoutingPFJet as a jagged-of-record (shared outer offsets) so
+                # uproot emits a single nScoutingPFJet counter instead of one
+                # counter per field.
                 print("  Copying input branches...", flush=True)
                 for branch in ak.fields(chunk):
-                    out_record[branch] = chunk[branch]
+                    val = chunk[branch]
+                    if branch == _JET_BRANCH and ak.fields(val):
+                        out_record[branch] = ak.zip({f: val[f] for f in ak.fields(val)})
+                    else:
+                        out_record[branch] = val
 
                 for model_cfg, session in zip(models, sessions):
                     prefix = _label_to_prefix(model_cfg["label"])
