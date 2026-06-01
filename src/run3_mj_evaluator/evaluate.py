@@ -302,6 +302,8 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk)
 
+                comb_prepped = None
+
                 # Both model types operate on the leading 6 pT jets.
                 # Select them once per chunk and share across all models.
                 comb_norm, comb_raw, _spher_6j, top6_idx = prepare_comb_input(
