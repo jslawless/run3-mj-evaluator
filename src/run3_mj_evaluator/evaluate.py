@@ -3,7 +3,8 @@
 
 Reads a slimmed ROOT file (produced by slim.py), runs one or more ONNX models
 on per-event jet 4-vectors, and writes a new ROOT file containing:
-  - All original branches (pass-through)
+  - All original non-jet branches (pass-through; the ScoutingPFJet branch is
+    intentionally omitted to avoid variable-length count branches in the output)
   - For each model: {label}Candidate_pt[2], eta[2], phi[2], mass[2],
     jetIdx0[2], jetIdx1[2], jetIdx2[2]  — the two predicted trijet particles
   - TH1 'version': config metadata.version string
@@ -344,10 +345,15 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 out_record = {}
 
-                # Pass through all original top-level branches (preserves nested
-                # ScoutingPFJet struct from the slimmer).
+                # Pass through all original top-level branches except the
+                # ScoutingPFJet jet collection.  Passing the jagged jet array
+                # through forces uproot to write a variable-length count branch
+                # (nScoutingPFJet) in the output, which is undesirable.  The
+                # raw jet data already lives in the original slim file.
                 print("  Copying input branches...", flush=True)
                 for branch in ak.fields(chunk):
+                    if branch == _JET_BRANCH:
+                        continue
                     out_record[branch] = chunk[branch]
 
                 for model_cfg, session in zip(models, sessions):
