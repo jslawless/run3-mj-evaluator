@@ -6,8 +6,8 @@ on per-event jet 4-vectors, and writes a new ROOT file containing:
   - All original branches (pass-through)
   - For each model: {label}Candidate_pt[2], eta[2], phi[2], mass[2],
     jetIdx0[2], jetIdx1[2], jetIdx2[2]  — the two predicted trijet particles
-  - TTree 'meta': evaluator version, config path, input path, model info
-  - Cutflow histogram passed through from the input file if present
+  - TH1 'version': config metadata.version string
+  - TH1 'cutflow': passed through from the input file if present
 
 Usage:
     python evaluate.py input.root output.root config.json
@@ -40,20 +40,12 @@ import warnings
 from itertools import combinations
 
 import awkward as ak
+import boost_histogram as bh
 import numpy as np
 import onnxruntime
 import uproot
 
-VERSION = "v1"
-
-_PT  = "ScoutingPFJet_pt"
-_ETA = "ScoutingPFJet_eta"
-_PHI = "ScoutingPFJet_phi"
-_M   = "ScoutingPFJet_m"
-_PX  = "ScoutingPFJet_px"
-_PY  = "ScoutingPFJet_py"
-_PZ  = "ScoutingPFJet_pz"
-_E   = "ScoutingPFJet_e"
+_JET_BRANCH = "ScoutingPFJet"
 
 _VALID_TYPES   = {"spanet", "comb_solver"}
 _VALID_FORMATS = {"cart", "spher"}
@@ -109,30 +101,22 @@ def _mask_from_lengths(lengths, max_len):
     return np.arange(max_len)[None, :] < np.asarray(lengths)[:, None]
 
 
-def chunk_to_numpy(chunk, has_cartesian):
-    """Convert one uproot chunk to padded (N, J) float64 arrays + bool mask.
-
-    has_cartesian: True if px/py/pz/e branches are already present.
-    """
-    n_jets = ak.to_numpy(ak.num(chunk[_PT], axis=1))
+def chunk_to_numpy(chunk):
+    """Convert one uproot chunk to padded (N, J) float64 arrays + bool mask."""
+    jets   = chunk[_JET_BRANCH]
+    n_jets = ak.to_numpy(ak.num(jets["pt"], axis=1))
     max_j  = int(n_jets.max()) if len(n_jets) > 0 else 0
 
     mask = _mask_from_lengths(n_jets, max_j)
-    pt   = _padded(chunk[_PT],  max_j)
-    eta  = _padded(chunk[_ETA], max_j)
-    phi  = _padded(chunk[_PHI], max_j)
+    pt   = _padded(jets["pt"],  max_j)
+    eta  = _padded(jets["eta"], max_j)
+    phi  = _padded(jets["phi"], max_j)
+    m    = _padded(jets["m"],   max_j)
 
-    if has_cartesian:
-        px = _padded(chunk[_PX], max_j)
-        py = _padded(chunk[_PY], max_j)
-        pz = _padded(chunk[_PZ], max_j)
-        e  = _padded(chunk[_E],  max_j)
-    else:
-        m  = _padded(chunk[_M], max_j)
-        px = pt * np.cos(phi)
-        py = pt * np.sin(phi)
-        pz = pt * np.sinh(eta)
-        e  = np.sqrt(px**2 + py**2 + pz**2 + m**2)
+    px = pt * np.cos(phi)
+    py = pt * np.sin(phi)
+    pz = pt * np.sinh(eta)
+    e  = np.sqrt(px**2 + py**2 + pz**2 + m**2)
 
     return pt, eta, phi, px, py, pz, e, mask
 
@@ -277,8 +261,8 @@ def _load_session(model_path):
 # ---------------------------------------------------------------------------
 
 def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_size):
-    models   = config["models"]
-    cfg_ver  = config.get("metadata", {}).get("version", "unknown")
+    models  = config["models"]
+    version = config.get("metadata", {}).get("version", "unknown")
 
     print(f"Input:   {input_path}  (tree: {in_tree_name})")
     print(f"Output:  {output_path}")
@@ -297,15 +281,8 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
         tree      = in_file[in_tree_name]
         tree_keys = set(tree.keys())
 
-        if _PT not in tree_keys:
-            sys.exit(f"Branch '{_PT}' not found in tree '{in_tree_name}'.")
-
-        has_cartesian = all(b in tree_keys for b in (_PX, _PY, _PZ, _E))
-        if not has_cartesian and _M not in tree_keys:
-            sys.exit(
-                "Cannot compute 4-vectors: input has neither px/py/pz/e "
-                "nor ScoutingPFJet_m branches."
-            )
+        if _JET_BRANCH not in tree_keys:
+            sys.exit(f"Branch '{_JET_BRANCH}' not found in tree '{in_tree_name}'.")
 
         total_in = total_out = 0
 
@@ -316,7 +293,7 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 n_chunk   = len(chunk)
                 total_in += n_chunk
 
-                pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk, has_cartesian)
+                pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk)
 
                 # Precompute comb-solver inputs once per chunk (shared across models)
                 comb_prepped = None
@@ -354,40 +331,31 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                     pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
 
                     # Store as (N, 2) fixed-size arrays: index 0 = candidate 1, index 1 = candidate 2
-                    out_record[f"{prefix}Candidate_pt"]      = np.stack([pt1,          pt2         ], axis=1).astype(np.float32)
-                    out_record[f"{prefix}Candidate_eta"]     = np.stack([eta1,         eta2        ], axis=1).astype(np.float32)
-                    out_record[f"{prefix}Candidate_phi"]     = np.stack([phi1,         phi2        ], axis=1).astype(np.float32)
-                    out_record[f"{prefix}Candidate_mass"]    = np.stack([m1,           m2          ], axis=1).astype(np.float32)
-                    out_record[f"{prefix}Candidate_jetIdx0"] = np.stack([t1_idx[:, 0], t2_idx[:, 0]], axis=1).astype(np.int32)
-                    out_record[f"{prefix}Candidate_jetIdx1"] = np.stack([t1_idx[:, 1], t2_idx[:, 1]], axis=1).astype(np.int32)
-                    out_record[f"{prefix}Candidate_jetIdx2"] = np.stack([t1_idx[:, 2], t2_idx[:, 2]], axis=1).astype(np.int32)
+                    out_record[f"{prefix}Candidate_pt"]      = ak.Array(np.stack([pt1,          pt2         ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_eta"]     = ak.Array(np.stack([eta1,         eta2        ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_phi"]     = ak.Array(np.stack([phi1,         phi2        ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_mass"]    = ak.Array(np.stack([m1,           m2          ], axis=1).astype(np.float32))
+                    out_record[f"{prefix}Candidate_jetIdx0"] = ak.Array(np.stack([t1_idx[:, 0], t2_idx[:, 0]], axis=1).astype(np.int32))
+                    out_record[f"{prefix}Candidate_jetIdx1"] = ak.Array(np.stack([t1_idx[:, 1], t2_idx[:, 1]], axis=1).astype(np.int32))
+                    out_record[f"{prefix}Candidate_jetIdx2"] = ak.Array(np.stack([t1_idx[:, 2], t2_idx[:, 2]], axis=1).astype(np.int32))
 
                 total_out += n_chunk
 
                 if out_tree is None:
-                    out_file["events"] = out_record
+                    out_file.mktree(
+                        "events",
+                        {name: arr.type for name, arr in out_record.items()},
+                    )
                     out_tree = out_file["events"]
-                else:
-                    out_tree.extend(out_record)
+                out_tree.extend(out_record)
 
                 print(f"  {total_in:>10,} events processed", end="\r")
 
-            # Metadata tree
-            all_paths  = ";".join(m["path"]  for m in models)
-            all_labels = ";".join(m["label"] for m in models)
-
-            def _enc(s, max_len=255):
-                b = s.encode("ascii")[:max_len]
-                return np.array([b], dtype=f"S{len(b)}")
-
-            out_file["meta"] = {
-                "evaluator_version": _enc(VERSION),
-                "config_version":    _enc(cfg_ver),
-                "config_file":       _enc(config_path),
-                "input_file":        _enc(input_path),
-                "model_paths":       _enc(all_paths,  max_len=1023),
-                "model_labels":      _enc(all_labels),
-            }
+            # Version histogram (StrCategory is the only reliable way to store
+            # strings in uproot; byte-string TTree branches trigger RNTuple routing).
+            version_hist = bh.Histogram(bh.axis.StrCategory([version]), storage=bh.storage.Double())
+            version_hist.view()[0] = 1.0
+            out_file["version"] = version_hist
 
             # Pass through cutflow histogram if present
             if "cutflow" in in_file:
