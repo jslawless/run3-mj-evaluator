@@ -5,7 +5,7 @@
     "models": [
         {
             "type":         "comb_solver",
-            "path":         "models/ml_model_final_20260429_210049_59fe174.onnx",
+            "path":         "models/ml_model_final_20260505_165042_5e8067a.onnx",
             "label":        "CombSolver",
             "normalized": true 
         }

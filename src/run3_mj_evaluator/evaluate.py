@@ -302,6 +302,7 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk)
 
+                comb_prepped = None
                 # CombSolver uses the top-7 pT jets; SPANet uses the top-6 (first 6
                 # of the same sorted list). Compute once and share across all models.
                 comb_norm, comb_raw, _spher_7j, top7_idx = prepare_comb_input(
