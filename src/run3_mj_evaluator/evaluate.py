@@ -39,7 +39,9 @@ Config JSON format:
 
 import argparse
 import json
+import os
 import sys
+import time
 import warnings
 from itertools import combinations
 
@@ -54,6 +56,91 @@ _GEN_JET_BRANCH = "GenJet"
 
 _VALID_TYPES   = {"spanet", "comb_solver"}
 _VALID_FORMATS = {"cart", "spher"}
+
+
+# ---------------------------------------------------------------------------
+# Timing / progress helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_duration(seconds):
+    """Format a duration in seconds as a compact human-readable string."""
+    if seconds < 1e-3:
+        return f"{seconds * 1e6:.0f}us"
+    if seconds < 1.0:
+        return f"{seconds * 1e3:.1f}ms"
+    if seconds < 60.0:
+        return f"{seconds:.2f}s"
+    m, s = divmod(seconds, 60.0)
+    if m < 60.0:
+        return f"{int(m)}m{s:04.1f}s"
+    h, m = divmod(int(m), 60)
+    return f"{h}h{int(m):02d}m{s:04.1f}s"
+
+
+class _Timer:
+    """Context manager: prints '<msg>... <duration>' on exit."""
+    def __init__(self, msg, indent="  "):
+        self.msg    = msg
+        self.indent = indent
+        self.t0     = None
+        self.dt     = None
+
+    def __enter__(self):
+        print(f"{self.indent}{self.msg}...", flush=True)
+        self.t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.dt = time.perf_counter() - self.t0
+        status = "FAILED" if exc_type is not None else "done"
+        print(f"{self.indent}  -> {status} in {_fmt_duration(self.dt)}", flush=True)
+        return False
+
+
+def _progress_iter(total, desc, indent="    ", min_interval=0.2, width=30):
+    """Yield 0..total-1, drawing an ASCII progress bar to stderr.
+
+    Designed for tight ONNX-inference loops: cheap (only redraws every
+    ``min_interval`` seconds), TTY-aware (falls back to periodic newline
+    output when stderr isn't a terminal so log files stay readable).
+    """
+    is_tty = sys.stderr.isatty() if hasattr(sys.stderr, "isatty") else False
+    t_start = time.perf_counter()
+    t_last  = 0.0
+    prefix  = f"{indent}{desc}"
+
+    def _draw(i, final=False):
+        elapsed = time.perf_counter() - t_start
+        frac    = i / total if total > 0 else 1.0
+        eta     = (elapsed / i) * (total - i) if i > 0 else 0.0
+        rate    = i / elapsed if elapsed > 0 else 0.0
+        if is_tty:
+            filled = int(width * frac)
+            bar = "#" * filled + "-" * (width - filled)
+            line = (
+                f"\r{prefix} [{bar}] {i:>{len(str(total))}}/{total} "
+                f"({frac * 100:5.1f}%) {rate:>6.1f}/s "
+                f"elapsed {_fmt_duration(elapsed)} eta {_fmt_duration(eta)}"
+            )
+            sys.stderr.write(line)
+            if final:
+                sys.stderr.write("\n")
+            sys.stderr.flush()
+        else:
+            sys.stderr.write(
+                f"{prefix} {i}/{total} ({frac * 100:.1f}%) "
+                f"{rate:.1f}/s elapsed {_fmt_duration(elapsed)} "
+                f"eta {_fmt_duration(eta)}\n"
+            )
+            sys.stderr.flush()
+
+    for i in range(total):
+        now = time.perf_counter()
+        if i == 0 or (now - t_last) >= min_interval:
+            _draw(i)
+            t_last = now
+        yield i
+    _draw(total, final=True)
 
 
 # ---------------------------------------------------------------------------
@@ -182,27 +269,41 @@ def chunk_to_numpy(chunk, branch=_JET_BRANCH, min_jets=0):
 # SPANet
 # ---------------------------------------------------------------------------
 
-def _extract_triplets(assignments):
+def _extract_triplets(assignments, progress_desc=None):
     """Argmax over (J, J, J) assignment tensor. assignments: (B, J, J, J) → (B, 3)."""
     B = assignments.shape[0]
     out = np.zeros((B, 3), dtype=int)
-    for b in range(B):
+    iterator = (
+        _progress_iter(B, progress_desc) if progress_desc is not None else range(B)
+    )
+    for b in iterator:
         out[b] = np.unravel_index(np.argmax(assignments[b]), assignments[b].shape)
     return out
 
 
-def run_spanet(session, source, mask):
+def run_spanet(session, source, mask, progress_label=None):
     """Run a SPANet session on a batch.
 
     source : (N, J, 4) float32
     mask   : (N, J) bool  — True for valid jets
     Returns t1_idx, t2_idx each (N, 3) int — indices into the J-jet array.
     """
+    print(f"      ONNX forward pass on {source.shape[0]:,} events...", flush=True)
+    t_fwd = time.perf_counter()
     t1_assign, t2_assign, _, _ = session.run(
         None,
         {"source_data": source, "source_mask": mask},
     )
-    return _extract_triplets(t1_assign), _extract_triplets(t2_assign)
+    print(
+        f"      ONNX forward pass done in {_fmt_duration(time.perf_counter() - t_fwd)}",
+        flush=True,
+    )
+    desc_t1 = f"{progress_label} argmax t1" if progress_label else None
+    desc_t2 = f"{progress_label} argmax t2" if progress_label else None
+    return (
+        _extract_triplets(t1_assign, progress_desc=desc_t1),
+        _extract_triplets(t2_assign, progress_desc=desc_t2),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +367,7 @@ def prepare_comb_input(pt, eta, phi, e, px, py, pz, mask):
     return input_norm, input_raw, spher_7jet, top7_idx
 
 
-def run_comb_solver(session, model_input):
+def run_comb_solver(session, model_input, progress_label=None):
     """Run a CombinatorialSolver session one event at a time (batch_size=1 baked in ONNX).
 
     model_input : (N, 7, 4) float32
@@ -274,7 +375,11 @@ def run_comb_solver(session, model_input):
     """
     N    = model_input.shape[0]
     best = np.empty(N, dtype=int)
-    for i in range(N):
+    desc = (
+        f"{progress_label} ONNX inference" if progress_label else None
+    )
+    iterator = _progress_iter(N, desc) if desc is not None else range(N)
+    for i in iterator:
         (logits,) = session.run(None, {"four_momenta": model_input[i : i + 1]})
         best[i]   = np.argmax(logits)
     return _COMB_G1[best], _COMB_G2[best]
@@ -361,25 +466,35 @@ def _evaluate_collection(
     for model_cfg, session in zip(models, sessions):
         prefix = _label_to_prefix(model_cfg["label"])
         mtype  = model_cfg["type"]
+        plabel = f"{model_cfg['label']}/{label_for_log}"
 
-        print(f"  Running {model_cfg['label']} ({mtype}) on {label_for_log} jets...", flush=True)
+        with _Timer(f"Running {model_cfg['label']} ({mtype}) on {label_for_log} jets ({n_chunk:,} events)"):
+            if mtype == "spanet":
+                if model_cfg["input_format"] == "cart":
+                    source = np.stack([px6, py6, pz6, e6], axis=-1).astype(np.float32)
+                else:
+                    source = np.stack([pt6, eta6, phi6, e6], axis=-1).astype(np.float32)
+                print(
+                    f"      input shape {source.shape} ({source.dtype}), "
+                    f"format={model_cfg['input_format']}",
+                    flush=True,
+                )
+                t1_6, t2_6 = run_spanet(session, source, mask6, progress_label=plabel)
+                t1_idx = top6_idx[rows7, t1_6]
+                t2_idx = top6_idx[rows7, t2_6]
+            elif mtype == "comb_solver":
+                comb_in = comb_norm if model_cfg["normalized"] else comb_raw
+                print(
+                    f"      input shape {comb_in.shape} ({comb_in.dtype}), "
+                    f"normalized={model_cfg['normalized']}",
+                    flush=True,
+                )
+                t1_7, t2_7 = run_comb_solver(session, comb_in, progress_label=plabel)
+                t1_idx = top7_idx[rows7, t1_7]
+                t2_idx = top7_idx[rows7, t2_7]
 
-        if mtype == "spanet":
-            if model_cfg["input_format"] == "cart":
-                source = np.stack([px6, py6, pz6, e6], axis=-1).astype(np.float32)
-            else:
-                source = np.stack([pt6, eta6, phi6, e6], axis=-1).astype(np.float32)
-            t1_6, t2_6 = run_spanet(session, source, mask6)
-            t1_idx = top6_idx[rows7, t1_6]
-            t2_idx = top6_idx[rows7, t2_6]
-        elif mtype == "comb_solver":
-            comb_in = comb_norm if model_cfg["normalized"] else comb_raw
-            t1_7, t2_7 = run_comb_solver(session, comb_in)
-            t1_idx = top7_idx[rows7, t1_7]
-            t2_idx = top7_idx[rows7, t2_7]
-
-        pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
-        pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
+            pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
+            pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
 
         base = f"{prefix}{candidate_infix}Candidate_"
         out[f"{base}pt"]      = _reg2(np.stack([pt1,          pt2         ], axis=1).astype(np.float32))
@@ -441,20 +556,40 @@ def _passthrough_branches(chunk, regroup_collections):
 
 def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_size,
              run_on_genjets=False):
+    job_t0 = time.perf_counter()
     models  = config["models"]
     version = config.get("metadata", {}).get("version", "unknown")
 
-    print(f"Input:   {input_path}  (tree: {in_tree_name})")
-    print(f"Output:  {output_path}")
-    print(f"Version: {version}")
-    print(f"Models:  {[m['label'] for m in models]}")
+    try:
+        in_size = os.path.getsize(input_path)
+        in_size_str = f"{in_size / (1024**2):.1f} MiB"
+    except OSError:
+        in_size_str = "?"
+
+    print(f"Job started:  {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Input:        {input_path}  (tree: {in_tree_name}, {in_size_str})")
+    print(f"Output:       {output_path}")
+    print(f"Config:       {config_path}")
+    print(f"Version:      {version}")
+    print(f"Chunk size:   {chunk_size:,}")
+    print(f"Models:       {[m['label'] for m in models]}")
+    print(f"Run on GenJet: {run_on_genjets}")
+    print(f"onnxruntime providers (available): {onnxruntime.get_available_providers()}")
     print()
 
     print("Loading ONNX sessions...")
-    sessions = []
+    sessions  = []
+    load_t0 = time.perf_counter()
     for m in models:
-        print(f"  {m['label']} ({m['type']})  <-  {m['path']}")
-        sessions.append(_load_session(m["path"]))
+        with _Timer(f"{m['label']} ({m['type']})  <-  {m['path']}"):
+            sess = _load_session(m["path"])
+            print(
+                f"    providers used: {sess.get_providers()}",
+                flush=True,
+            )
+            sessions.append(sess)
+    print(f"  All {len(sessions)} session(s) loaded in "
+          f"{_fmt_duration(time.perf_counter() - load_t0)}.")
     print()
 
     with uproot.open(input_path) as in_file:
@@ -497,33 +632,43 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
         print()
 
         total_in = total_out = 0
+        chunk_times = []
 
         with uproot.recreate(output_path) as out_file:
             out_tree  = None
             chunk_num = 0
 
             for chunk in tree.iterate(library="ak", step_size=chunk_size):
+                chunk_t0  = time.perf_counter()
                 chunk_num += 1
                 n_chunk    = len(chunk)
                 total_in  += n_chunk
                 print(
                     f"[{chunk_num}/{n_chunks}] Chunk of {n_chunk:,} events"
-                    f"  (running total: {total_in:,}/{total_entries:,})"
+                    f"  (running total: {total_in:,}/{total_entries:,},"
+                    f" {100.0 * total_in / total_entries:.1f}%)"
                 )
 
-                print("  Converting branches to numpy arrays...", flush=True)
                 # Pad to ≥7 slots so CombSolver always sees (N, 7, 4); reco
                 # already has ≥6 jets thanks to the slimmer, but GenJets may
                 # have fewer in some events.
-                pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk, min_jets=7)
+                with _Timer("Converting reco branches to numpy arrays"):
+                    pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk, min_jets=7)
+                    print(
+                        f"    padded shape: {pt.shape}, "
+                        f"valid jets/event mean={mask.sum(1).mean():.2f} "
+                        f"min={mask.sum(1).min()} max={mask.sum(1).max()}",
+                        flush=True,
+                    )
 
                 # Pass through all original top-level branches, regrouping any
                 # flat ScoutingPFJet_*/GenJet_* layout into a single nested
                 # record so the output is layout-independent.
-                print("  Copying input branches...", flush=True)
-                out_record = _passthrough_branches(
-                    chunk, [_JET_BRANCH, _GEN_JET_BRANCH]
-                )
+                with _Timer("Copying input branches"):
+                    out_record = _passthrough_branches(
+                        chunk, [_JET_BRANCH, _GEN_JET_BRANCH]
+                    )
+                    print(f"    {len(out_record)} input branches passed through", flush=True)
 
                 out_record.update(_evaluate_collection(
                     models, sessions, pt, eta, phi, e, px, py, pz, mask,
@@ -531,10 +676,16 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 ))
 
                 if run_on_genjets:
-                    print("  Converting GenJet branches to numpy arrays...", flush=True)
-                    g_pt, g_eta, g_phi, g_px, g_py, g_pz, g_e, g_mask = chunk_to_numpy(
-                        chunk, branch=_GEN_JET_BRANCH, min_jets=7,
-                    )
+                    with _Timer("Converting GenJet branches to numpy arrays"):
+                        g_pt, g_eta, g_phi, g_px, g_py, g_pz, g_e, g_mask = chunk_to_numpy(
+                            chunk, branch=_GEN_JET_BRANCH, min_jets=7,
+                        )
+                        print(
+                            f"    padded shape: {g_pt.shape}, "
+                            f"valid jets/event mean={g_mask.sum(1).mean():.2f} "
+                            f"min={g_mask.sum(1).min()} max={g_mask.sum(1).max()}",
+                            flush=True,
+                        )
                     out_record.update(_evaluate_collection(
                         models, sessions,
                         g_pt, g_eta, g_phi, g_e, g_px, g_py, g_pz, g_mask,
@@ -543,15 +694,27 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
                 total_out += n_chunk
 
-                print(f"  Writing {n_chunk:,} events to output...", flush=True)
-                if out_tree is None:
-                    out_file.mktree(
-                        "events",
-                        {name: arr.type for name, arr in out_record.items()},
-                    )
-                    out_tree = out_file["events"]
-                out_tree.extend(out_record)
-                print(f"  Chunk {chunk_num}/{n_chunks} complete.")
+                with _Timer(f"Writing {n_chunk:,} events ({len(out_record)} branches) to output"):
+                    if out_tree is None:
+                        out_file.mktree(
+                            "events",
+                            {name: arr.type for name, arr in out_record.items()},
+                        )
+                        out_tree = out_file["events"]
+                    out_tree.extend(out_record)
+
+                chunk_dt = time.perf_counter() - chunk_t0
+                chunk_times.append(chunk_dt)
+                rate     = n_chunk / chunk_dt if chunk_dt > 0 else 0.0
+                # Project remaining time from the average chunk rate so far.
+                remaining = total_entries - total_in
+                avg_rate  = total_in / sum(chunk_times) if sum(chunk_times) > 0 else rate
+                eta_s     = remaining / avg_rate if avg_rate > 0 else 0.0
+                print(
+                    f"  Chunk {chunk_num}/{n_chunks} complete in "
+                    f"{_fmt_duration(chunk_dt)} ({rate:.1f} events/s). "
+                    f"Job ETA: {_fmt_duration(eta_s)}"
+                )
                 print()
 
             # Version histogram (StrCategory is the only reliable way to store
@@ -562,10 +725,31 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
             # Pass through cutflow histogram if present
             if "cutflow" in in_file:
-                print("Copying cutflow histogram from input...")
-                out_file["cutflow"] = in_file["cutflow"]
+                with _Timer("Copying cutflow histogram from input", indent=""):
+                    out_file["cutflow"] = in_file["cutflow"]
 
+    wall = time.perf_counter() - job_t0
+    avg_rate = total_in / wall if wall > 0 else 0.0
+    try:
+        out_size = os.path.getsize(output_path)
+        out_size_str = f"{out_size / (1024**2):.1f} MiB"
+    except OSError:
+        out_size_str = "?"
+
+    print("=" * 72)
     print(f"Done.  {total_in:,} events processed -> {total_out:,} written.")
+    print(f"Output file:    {output_path} ({out_size_str})")
+    if chunk_times:
+        print(
+            f"Chunks:         {len(chunk_times)} "
+            f"(min {_fmt_duration(min(chunk_times))}, "
+            f"max {_fmt_duration(max(chunk_times))}, "
+            f"avg {_fmt_duration(sum(chunk_times) / len(chunk_times))})"
+        )
+    print(f"Average rate:   {avg_rate:.1f} events/s")
+    print(f"Job finished:   {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Total wall time: {_fmt_duration(wall)}")
+    print("=" * 72)
 
 
 # ---------------------------------------------------------------------------
@@ -602,15 +786,25 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    evaluate(
-        input_path=args.input,
-        output_path=args.output,
-        config=cfg,
-        config_path=args.config,
-        in_tree_name=args.tree,
-        chunk_size=args.chunk_size,
-        run_on_genjets=args.run_on_genjets,
-    )
+    main_t0 = time.perf_counter()
+    try:
+        evaluate(
+            input_path=args.input,
+            output_path=args.output,
+            config=cfg,
+            config_path=args.config,
+            in_tree_name=args.tree,
+            chunk_size=args.chunk_size,
+            run_on_genjets=args.run_on_genjets,
+        )
+    except BaseException as exc:
+        wall = time.perf_counter() - main_t0
+        print(
+            f"\nJob aborted after {_fmt_duration(wall)}: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        raise
 
 
 if __name__ == "__main__":
