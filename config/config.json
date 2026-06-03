@@ -14,6 +14,13 @@
             "path":         "models/classical_mass_asymmetry_final_20260505_165042_5e8067a.onnx",
             "label":        "Mass Asymmetry",
             "normalized": true 
+        },
+        {
+            "type":         "spanet",
+            "path":         "models/spanet.onnx",
+            "label":        "SPANet",
+            "input_format": "spher_log",
+            "num_jets":     8
         }
 
     ]

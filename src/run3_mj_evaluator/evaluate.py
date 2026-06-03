@@ -56,7 +56,15 @@ _GEN_JET_BRANCH  = "GenJet"
 _GEN_PART_BRANCH = "GenPart"
 
 _VALID_TYPES   = {"spanet", "comb_solver"}
-_VALID_FORMATS = {"cart", "spher"}
+# SPANet input_format controls the 4 features packed into source_data:
+#   cart      -> [px, py, pz, e]            (raw)
+#   spher     -> [pt, eta, phi, e]          (raw)
+#   spher_log -> [log(pt+1), eta, phi, log(e+1)]
+# Use spher_log for models trained with `pt: log_normalize, e: log_normalize`
+# (eta/phi: normalize) that were exported WITHOUT SPANet's --input-log-transform:
+# the per-feature (x-mean)/std standardization is baked into the ONNX graph (its
+# stats are in log space for pt/e), but the log(x+1) is not, so we apply it here.
+_VALID_FORMATS = {"cart", "spher", "spher_log"}
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +176,10 @@ def load_config(config_path):
             sys.exit(f"Model {i} unknown type '{m['type']}'. Valid: {_VALID_TYPES}")
         if m["type"] == "spanet":
             if m.get("input_format") not in _VALID_FORMATS:
-                sys.exit(f"Model {i} (spanet) 'input_format' must be 'cart' or 'spher'.")
+                sys.exit(
+                    f"Model {i} (spanet) 'input_format' must be one of "
+                    f"{sorted(_VALID_FORMATS)}."
+                )
         if m["type"] == "comb_solver" and "normalized" not in m:
             sys.exit(f"Model {i} (comb_solver) must have 'normalized': true or false.")
 
@@ -459,18 +470,22 @@ def _evaluate_collection(
     comb_norm, comb_raw, _spher_7j, top7_idx = prepare_comb_input(
         pt, eta, phi, e, px, py, pz, mask
     )
-    rows7    = np.arange(n_chunk)[:, None]
-    top6_idx = top7_idx[:, :6]
-    pt6  = pt [rows7, top6_idx]
-    eta6 = eta[rows7, top6_idx]
-    phi6 = phi[rows7, top6_idx]
-    e6   = e  [rows7, top6_idx]
-    px6  = px [rows7, top6_idx]
-    py6  = py [rows7, top6_idx]
-    pz6  = pz [rows7, top6_idx]
-    # Use the real mask so SPANet ignores padded slots in low-multiplicity events
-    # (e.g. GenJet). For reco, slimmer guarantees ≥6 jets so this is all-True.
-    mask6 = mask[rows7, top6_idx]
+    rows7 = np.arange(n_chunk)[:, None]
+
+    # SPANet jet count is baked into each exported model (its attention reshape
+    # fixes the sequence length). Select the top-n pT jets, padded/masked to n.
+    pt_masked = np.where(mask, pt, -np.inf)
+    sorted_idx = np.argsort(-pt_masked, axis=1)  # (N, J) pT-descending
+
+    def _topn(n):
+        idx = sorted_idx[:, :n]                  # (N, n) into the full jet array
+        rows = np.arange(n_chunk)[:, None]
+        return (
+            pt[rows, idx], eta[rows, idx], phi[rows, idx], e[rows, idx],
+            px[rows, idx], py[rows, idx], pz[rows, idx],
+            mask[rows, idx],  # real mask: masked padded slots in low-mult events
+            idx,
+        )
 
     def _reg2(a):
         return ak.to_regular(ak.Array(a), axis=1)
@@ -485,18 +500,28 @@ def _evaluate_collection(
 
         with _Timer(f"Running {model_cfg['label']} ({mtype}) on {label_for_log} jets ({n_chunk:,} events)"):
             if mtype == "spanet":
-                if model_cfg["input_format"] == "cart":
-                    source = np.stack([px6, py6, pz6, e6], axis=-1).astype(np.float32)
-                else:
-                    source = np.stack([pt6, eta6, phi6, e6], axis=-1).astype(np.float32)
+                n_src = int(model_cfg.get("num_jets", 8))
+                ptn, etan, phin, en, pxn, pyn, pzn, maskn, topn_idx = _topn(n_src)
+                rows_n = np.arange(n_chunk)[:, None]
+                ifmt = model_cfg["input_format"]
+                if ifmt == "cart":
+                    source = np.stack([pxn, pyn, pzn, en], axis=-1).astype(np.float32)
+                elif ifmt == "spher_log":
+                    # log_normalize(pt, e): apply log(x+1) here; the (x-mean)/std
+                    # standardization (with log-space stats) is inside the graph.
+                    source = np.stack(
+                        [np.log1p(ptn), etan, phin, np.log1p(en)], axis=-1
+                    ).astype(np.float32)
+                else:  # "spher"
+                    source = np.stack([ptn, etan, phin, en], axis=-1).astype(np.float32)
                 print(
                     f"      input shape {source.shape} ({source.dtype}), "
-                    f"format={model_cfg['input_format']}",
+                    f"format={ifmt}, num_jets={n_src}",
                     flush=True,
                 )
-                t1_6, t2_6 = run_spanet(session, source, mask6, progress_label=plabel)
-                t1_idx = top6_idx[rows7, t1_6]
-                t2_idx = top6_idx[rows7, t2_6]
+                t1_n, t2_n = run_spanet(session, source, maskn, progress_label=plabel)
+                t1_idx = topn_idx[rows_n, t1_n]
+                t2_idx = topn_idx[rows_n, t2_n]
             elif mtype == "comb_solver":
                 comb_in = comb_norm if model_cfg["normalized"] else comb_raw
                 print(
@@ -574,6 +599,12 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
     job_t0 = time.perf_counter()
     models  = config["models"]
     version = config.get("metadata", {}).get("version", "unknown")
+
+    # Pad jet arrays wide enough for the most jet-hungry model: CombSolver needs
+    # top-7, each SPANet needs its baked-in num_jets (default 8).
+    pad_width = max(
+        [7] + [int(m.get("num_jets", 8)) for m in models if m["type"] == "spanet"]
+    )
 
     try:
         in_size = os.path.getsize(input_path)
@@ -668,7 +699,7 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 # already has ≥6 jets thanks to the slimmer, but GenJets may
                 # have fewer in some events.
                 with _Timer("Converting reco branches to numpy arrays"):
-                    pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk, min_jets=7)
+                    pt, eta, phi, px, py, pz, e, mask = chunk_to_numpy(chunk, min_jets=pad_width)
                     print(
                         f"    padded shape: {pt.shape}, "
                         f"valid jets/event mean={mask.sum(1).mean():.2f} "
@@ -693,7 +724,7 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
                 if run_on_genjets:
                     with _Timer("Converting GenJet branches to numpy arrays"):
                         g_pt, g_eta, g_phi, g_px, g_py, g_pz, g_e, g_mask = chunk_to_numpy(
-                            chunk, branch=_GEN_JET_BRANCH, min_jets=7,
+                            chunk, branch=_GEN_JET_BRANCH, min_jets=pad_width,
                         )
                         print(
                             f"    padded shape: {g_pt.shape}, "
