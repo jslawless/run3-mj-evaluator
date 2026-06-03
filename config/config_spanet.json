@@ -1,0 +1,14 @@
+{
+    "metadata": {
+        "version": "v1"
+    },
+    "models": [
+        {
+            "type":         "spanet",
+            "path":         "models/spanet.onnx",
+            "label":        "SPANet",
+            "input_format": "spher_log",
+            "num_jets":     8
+        }
+    ]
+}

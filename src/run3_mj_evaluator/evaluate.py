@@ -532,7 +532,7 @@ def _evaluate_collection(
                 t1_7, t2_7 = run_comb_solver(session, comb_in, progress_label=plabel)
                 t1_idx = top7_idx[rows7, t1_7]
                 t2_idx = top7_idx[rows7, t2_7]
-
+            #TODO -- Switch to a Triplet class instead -- easier to mantain
             pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
             pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
 
