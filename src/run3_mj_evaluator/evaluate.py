@@ -640,10 +640,25 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
 
     with uproot.open(input_path) as in_file:
         if in_tree_name not in in_file:
-            sys.exit(
-                f"Tree '{in_tree_name}' not found in {input_path}. "
-                f"Available keys: {list(in_file.keys())}"
+            # The slimmer emits cutflow-only files (no events tree) for slices
+            # where nothing passed its cuts. Mirror that to a cutflow-only
+            # evaluated file (pass version + cutflow through) and finish
+            # successfully, so the analyzer's N_original chain stays intact
+            # rather than this job failing on an empty slice.
+            print(
+                f"No '{in_tree_name}' tree in {input_path} (empty slice) -> "
+                "writing cutflow-only output."
             )
+            with uproot.recreate(output_path) as out_file:
+                version_hist = bh.Histogram(
+                    bh.axis.StrCategory([version]), storage=bh.storage.Double()
+                )
+                version_hist.view()[0] = 1.0
+                out_file["version"] = version_hist
+                if "cutflow" in in_file:
+                    out_file["cutflow"] = in_file["cutflow"]
+            print(f"Done.  Cutflow-only output written: {output_path}")
+            return
 
         tree      = in_file[in_tree_name]
         tree_keys = set(tree.keys())

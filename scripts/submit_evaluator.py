@@ -12,9 +12,14 @@ Build the wheel before submitting:
 Submit:
     python submit_evaluator.py \\
         -i fileset.json \\
-        -o root://cmseos.fnal.gov//store/user/you/evaluated \\
+        -o /store/user/you/evaluated \\
         --config config.json \\
         --wheel run3_mj_evaluator-1.0.0-py3-none-any.whl
+
+-o / --eosoutdir is a BARE EOS path (e.g. /store/user/you/evaluated); the job
+script adds the root://cmseos.fnal.gov/ redirector automatically. A full
+root://host//store/... URL is also accepted - the leading redirector is stripped
+so it is never doubled in the xrdcp destination.
 
 Fileset JSON format (coffea-style):
     {
@@ -34,6 +39,7 @@ flattens transfer_input_files into the job's working directory.
 """
 
 import os
+import re
 import argparse
 import json
 
@@ -76,12 +82,15 @@ pip install --quiet {WHEEL}
 
 ## Run
 echo
-# mkdir -p output_files
+# Abort (non-zero exit, nothing uploaded) if the evaluator fails, so partial
+# outputs are never xrdcp'd to EOS.
+set -e
 {RUN_COMMANDS}
+set +e
 echo "what directory am I in?"
 pwd
 echo "List all root files = "
-ls *.root
+ls *.root 2>/dev/null || echo "  (no .root output produced)"
 echo "List all files"
 ls -alh
 echo "*******************************************"
@@ -91,21 +100,25 @@ echo "xrdcp output for condor to "
 
 EXECUTABLE_TEMPLATE2 = """\
 echo $OUTDIR
-for FILE in evaluated_*.root
+# Fail loudly (non-zero exit) if the evaluator delivered no output, instead of
+# the old confusing "xrdcp ... no such file" when the glob is empty.
+shopt -s nullglob
+root_files=( evaluated_*.root )
+if [[ ${#root_files[@]} -eq 0 ]]; then
+  echo "ERROR: evaluator produced no evaluated_*.root output - nothing to deliver to EOS." >&2
+  exit 1
+fi
+for FILE in "${root_files[@]}"
 do
   echo "xrdcp -f ${FILE} ${OUTDIR}/${FILE}"
-  echo "${FILE}"
-  echo "${OUTDIR}"
- xrdcp -f ${FILE} ${OUTDIR}/${FILE} 2>&1
+  xrdcp -f "${FILE}" "${OUTDIR}/${FILE}" 2>&1
   XRDEXIT=$?
   if [[ $XRDEXIT -ne 0 ]]; then
-    rm *.root ###note if you do this locally you remove possibly IMPORTANT ROOT FILES
-    ### always be careful with "rm"
-    echo "exit code $XRDEXIT, failure in xrdcp"
+    echo "ERROR: xrdcp of ${FILE} failed (exit ${XRDEXIT}); output NOT delivered." >&2
+    rm -f -- "${FILE}"   # worker scratch only
     exit $XRDEXIT
   fi
-  rm ${FILE} ###note if you do this locally you remove possibly IMPORTANT ROOT FILES
-    ### always be careful with "rm"
+  rm -f -- "${FILE}"     # worker scratch only
 done
 
 echo
@@ -284,7 +297,7 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("-i", "--inFile",   required=True,  help="Coffea-style fileset JSON of slimmed files")
-    parser.add_argument("-o", "--eosoutdir",   required=True,  help="EOS Output directory")
+    parser.add_argument("-o", "--eosoutdir",   required=True,  help="EOS output dir as a bare /store/... path (cmseos redirector added automatically)")
     parser.add_argument("--config",         required=True,  help="run3-mj-evaluator config JSON")
     parser.add_argument("--wheel",          required=True,  help="Pre-built run3-mj-evaluator .whl file")
     parser.add_argument("-n", "--nfPerJob", type=int, default=1, help="Files per job")
@@ -296,6 +309,12 @@ if __name__ == "__main__":
     parser.add_argument("--exec",   action="store_true", help="Submit jobs immediately after writing")
 
     args = parser.parse_args()
+
+    # The job template (EXECUTABLE_TEMPLATE) already prepends the cmseos.fnal.gov
+    # redirector to the output dir, so accept a bare /store/... path. If a full
+    # root://host//store/... URL is given, strip the leading redirector to avoid
+    # a doubled prefix in the xrdcp destination.
+    args.eosoutdir = re.sub(r"^root://[^/]+/+", "/", args.eosoutdir)
 
     fileset = Fileset(args)
     batch = Batch(fileset.jobs, args)
