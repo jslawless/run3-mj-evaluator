@@ -57,6 +57,7 @@ transfer_input_files    = {transfer}
 RequestCPUs             = {cpu}
 +JobFlavour             = {queue}
 request_memory          = {ram}
+use_x509userproxy       = true
 
 queue name from (
 {names}
@@ -74,6 +75,30 @@ echo
 echo "Work Area: $workarea"
 ls
 echo
+
+## The evaluator wheel needs Python >=3.8, but the bare worker / default
+## apptainer container can hand us a python3 as old as 3.6 (el8/sl7), making
+## pip refuse the wheel ("requires Python '>=3.8'") and leaving the
+## run3-mj-evaluator entry point uninstalled. Source the cvmfs LCG view
+## matching this node's OS *only* for its modern python3, then build an
+## ISOLATED venv from it and pip-install the wheel WITH its PyPI deps
+## (onnxruntime etc.). Unlike the slimmer there is no coffea/correctionlib
+## here, so PyPI wheels are safe - and PYTHONPATH is unset so the view's own
+## uproot/awkward do not shadow the pip-installed versions.
+export LC_ALL=C.UTF-8 LANG=C.UTF-8 LC_CTYPE=C.UTF-8
+LCG_BASE=/cvmfs/sft.cern.ch/lcg/views/LCG_106
+osmaj=$(rpm -E %{{rhel}} 2>/dev/null || echo 9)
+LCG_VIEW=$(ls "$LCG_BASE"/x86_64-el${{osmaj}}-gcc*-opt/setup.sh 2>/dev/null | sort -V | tail -1)
+if [ -z "$LCG_VIEW" ] || [ ! -r "$LCG_VIEW" ]; then
+  # Last resort: newest gcc for any arch this node can run.
+  LCG_VIEW=$(ls "$LCG_BASE"/x86_64-el*-gcc*-opt/setup.sh 2>/dev/null | sort -V | tail -1)
+fi
+echo "Node OS major: $osmaj"
+echo "Sourcing LCG view: $LCG_VIEW"
+source "$LCG_VIEW"
+export LC_ALL=C.UTF-8 LANG=C.UTF-8 LC_CTYPE=C.UTF-8   # re-assert: the view may reset LC_*
+unset PYTHONPATH
+echo "Base python: $(python3 --version)"
 
 ## Set up Python virtual environment and install run3-mj-evaluator
 python3 -m venv .venv
