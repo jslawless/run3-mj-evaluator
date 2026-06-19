@@ -11,8 +11,9 @@ echo "wall,events"
 
 for f in "$1"/*.out; do
 	awk -v job="$(basename "$f")" '
-	/Total wall time:/  { t = $NF }
-	/events processed/  { e = $2 }
+	# Strip thousands-separator commas so the values don't break the CSV.
+	/Total wall time:/  { t = $NF; gsub(/,/, "", t) }
+	/events processed/  { e = $2;  gsub(/,/, "", e) }
 	END {
 		# Skip blank entries: only print rows where both values were found.
 		if (t != "" && e != "") {
