@@ -437,7 +437,8 @@ def _load_session(model_path):
     # oversubscribes the slot. Pin the thread counts explicitly -- this both
     # silences the affinity calls and matches the requested CPUs. Honour
     # ORT_NUM_THREADS / OMP_NUM_THREADS if set, else default to 1 (the
-    # comb_solver runs in batches of 2048, so intra-op threads buy little).
+    # comb_solver now batches 2048 events per call, so intra-op parallelism
+    # across the batch is worthwhile when multiple cores are available).
     n_threads = int(os.environ.get("ORT_NUM_THREADS")
                     or os.environ.get("OMP_NUM_THREADS")
                     or 1)
