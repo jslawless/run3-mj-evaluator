@@ -386,6 +386,10 @@ def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
     can score many events per session.run call. Chunking — rather than one
     giant call — keeps the 70-assignment expansion cache-friendly and bounds
     peak memory.
+
+    model_input : (N, 7, 4) float32
+    batch_size  : number of events per session.run call (default 2048)
+    Returns t1_idx, t2_idx each (N, 3) int — indices into the 7-jet array.
     """
     N = model_input.shape[0]
     best = np.empty(N, dtype=np.int64)
