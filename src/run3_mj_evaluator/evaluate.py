@@ -379,21 +379,19 @@ def prepare_comb_input(pt, eta, phi, e, px, py, pz, mask):
     return input_norm, input_raw, spher_7jet, top7_idx
 
 
-def run_comb_solver(session, model_input, progress_label=None):
-    """Run a CombinatorialSolver session one event at a time (batch_size=1 baked in ONNX).
+def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
+    """Run the CombinatorialSolver in batches.
 
-    model_input : (N, 7, 4) float32
-    Returns t1_idx, t2_idx each (N, 3) int — indices into the 7-jet array.
+    The exported ONNX has a dynamic batch axis (input ['batch', 7, 4]), so we
+    can score many events per session.run call. Chunking — rather than one
+    giant call — keeps the 70-assignment expansion cache-friendly and bounds
+    peak memory.
     """
-    N    = model_input.shape[0]
-    best = np.empty(N, dtype=int)
-    desc = (
-        f"{progress_label} ONNX inference" if progress_label else None
-    )
-    iterator = _progress_iter(N, desc) if desc is not None else range(N)
-    for i in iterator:
-        (logits,) = session.run(None, {"four_momenta": model_input[i : i + 1]})
-        best[i]   = np.argmax(logits)
+    N = model_input.shape[0]
+    best = np.empty(N, dtype=np.int64)
+    for i in range(0, N, batch_size):
+        (logits,) = session.run(None, {"four_momenta": model_input[i : i + batch_size]})
+        best[i : i + batch_size] = np.argmax(logits, axis=-1)
     return _COMB_G1[best], _COMB_G2[best]
 
 
@@ -435,7 +433,7 @@ def _load_session(model_path):
     # oversubscribes the slot. Pin the thread counts explicitly -- this both
     # silences the affinity calls and matches the requested CPUs. Honour
     # ORT_NUM_THREADS / OMP_NUM_THREADS if set, else default to 1 (the
-    # comb_solver runs one event at a time, so intra-op threads buy little).
+    # comb_solver runs in batches of 2048, so intra-op threads buy little).
     n_threads = int(os.environ.get("ORT_NUM_THREADS")
                     or os.environ.get("OMP_NUM_THREADS")
                     or 1)
