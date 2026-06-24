@@ -54,6 +54,11 @@ error                   = {logdir}/log_$(ClusterId)_$(name).err
 log                     = {logdir}/log_$(ClusterId)_$(name).log
 Should_Transfer_Files   = YES
 transfer_input_files    = {transfer}
+# The job stages its own output to EOS via xrdcp, so condor must transfer
+# NOTHING back. Without this, condor's default returns every leftover top-level
+# sandbox file to the submit dir -- e.g. an evaluated_*.root from a job that
+# died before its xrdcp -- which looks like "output went local instead of EOS".
+transfer_output_files   = ""
 RequestCPUs             = {cpu}
 +JobFlavour             = {queue}
 request_memory          = {ram}
