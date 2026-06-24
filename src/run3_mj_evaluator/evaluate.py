@@ -6,7 +6,10 @@ on per-event jet 4-vectors, and writes a new ROOT file containing:
   - All original branches (pass-through), including a GenJet collection if the
     input is MC and contains one.
   - For each model: {label}Candidate_pt[2], eta[2], phi[2], mass[2],
-    jetIdx0[2], jetIdx1[2], jetIdx2[2]  — the two predicted trijet particles.
+    jetIdx0[2], jetIdx1[2], jetIdx2[2]  — the two predicted trijet particles —
+    plus mHigh[2], mMid[2], mLow[2] (per-candidate ranked normalized Dalitz
+    mass-squared variables, m_high >= m_mid >= m_low) and massAsymmetry
+    (scalar |m1 - m2| / |m1 + m2| between the two candidates).
   - With --run-on-genjets: additional {label}GenCandidate_* branches produced
     by running each model on the GenJet collection (indices point into GenJet).
   - TH1 'version': config metadata.version string
@@ -418,6 +421,69 @@ def candidate_fourvec(pt, eta, phi, e, indices):
 
 
 # ---------------------------------------------------------------------------
+# Derived candidate observables
+# ---------------------------------------------------------------------------
+
+def mass_asymmetry(m1, m2):
+    """Mass asymmetry between an event's two candidate tri-jets.
+
+    |m1 - m2| / |m1 + m2|, matching run3_mj_analyzer.observables.mass_asymmetry.
+    Bounded to [0, 1] for physical (non-negative) masses; returns 0 when both
+    candidate masses vanish (degenerate / empty events) to avoid 0/0.
+
+    m1, m2 : (N,) float64
+    Returns (N,) float64.
+    """
+    denom = np.abs(m1 + m2)
+    return np.where(denom > 0, np.abs(m1 - m2) / np.where(denom > 0, denom, 1.0), 0.0)
+
+
+def dalitz_masses_sq(pt, eta, phi, e, indices):
+    """Ranked, normalized Dalitz mass-squared variables for a trijet candidate.
+
+    For the three jets in ``indices`` compute the three pairwise invariant
+    mass-squared values (p_i + p_j)^2, each normalized by
+        den = M_123^2 + m_1^2 + m_2^2 + m_3^2
+    (matching helper_functions.tri_mds in run3-scouting-multijets), then sort
+    per event so the return is (m_high, m_mid, m_low), each (N,) float64 with
+    m_high >= m_mid >= m_low.
+
+    pt, eta, phi, e : (N, J) float64
+    indices         : (N, 3) int
+    """
+    rows = np.arange(len(indices))[:, None]
+    pti  = pt [rows, indices]            # (N, 3)
+    etai = eta[rows, indices]
+    phii = phi[rows, indices]
+    ei   = e  [rows, indices]
+    pxi  = pti * np.cos(phii)
+    pyi  = pti * np.sin(phii)
+    pzi  = pti * np.sinh(etai)
+
+    # Per-jet and full-triplet invariant mass^2, clamped to >= 0 like the
+    # candidate reconstruction (rounding can push these slightly negative).
+    mi2 = np.maximum(ei**2 - (pxi**2 + pyi**2 + pzi**2), 0.0)          # (N, 3)
+    e3, px3, py3, pz3 = ei.sum(1), pxi.sum(1), pyi.sum(1), pzi.sum(1)
+    m123_2 = np.maximum(e3**2 - (px3**2 + py3**2 + pz3**2), 0.0)       # (N,)
+
+    den = m123_2 + mi2.sum(1)                                          # (N,)
+    den = np.where(den > 0, den, 1.0)
+
+    pair_m2 = []
+    for a, b in ((0, 1), (0, 2), (1, 2)):
+        ep  = ei [:, a] + ei [:, b]
+        pxp = pxi[:, a] + pxi[:, b]
+        pyp = pyi[:, a] + pyi[:, b]
+        pzp = pzi[:, a] + pzi[:, b]
+        mab2 = np.maximum(ep**2 - (pxp**2 + pyp**2 + pzp**2), 0.0)
+        pair_m2.append(mab2 / den)
+
+    ranked = np.sort(np.stack(pair_m2, axis=1), axis=1)               # ascending (N, 3)
+    m_low, m_mid, m_high = ranked[:, 0], ranked[:, 1], ranked[:, 2]
+    return m_high, m_mid, m_low
+
+
+# ---------------------------------------------------------------------------
 # ONNX session loader
 # ---------------------------------------------------------------------------
 
@@ -530,6 +596,12 @@ def _evaluate_collection(
             pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
             pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
 
+            # Ranked Dalitz mass-squared variables (per candidate) and the
+            # mass asymmetry between the two candidates.
+            d1_high, d1_mid, d1_low = dalitz_masses_sq(pt, eta, phi, e, t1_idx)
+            d2_high, d2_mid, d2_low = dalitz_masses_sq(pt, eta, phi, e, t2_idx)
+            masym = mass_asymmetry(m1, m2)
+
         base = f"{prefix}{candidate_infix}Candidate_"
         out[f"{base}pt"]      = _reg2(np.stack([pt1,          pt2         ], axis=1).astype(np.float32))
         out[f"{base}eta"]     = _reg2(np.stack([eta1,         eta2        ], axis=1).astype(np.float32))
@@ -538,6 +610,10 @@ def _evaluate_collection(
         out[f"{base}jetIdx0"] = _reg2(np.stack([t1_idx[:, 0], t2_idx[:, 0]], axis=1).astype(np.int32))
         out[f"{base}jetIdx1"] = _reg2(np.stack([t1_idx[:, 1], t2_idx[:, 1]], axis=1).astype(np.int32))
         out[f"{base}jetIdx2"] = _reg2(np.stack([t1_idx[:, 2], t2_idx[:, 2]], axis=1).astype(np.int32))
+        out[f"{base}mHigh"]   = _reg2(np.stack([d1_high,      d2_high     ], axis=1).astype(np.float32))
+        out[f"{base}mMid"]    = _reg2(np.stack([d1_mid,       d2_mid      ], axis=1).astype(np.float32))
+        out[f"{base}mLow"]    = _reg2(np.stack([d1_low,       d2_low      ], axis=1).astype(np.float32))
+        out[f"{base}massAsymmetry"] = ak.Array(masym.astype(np.float32))
 
     return out
 
