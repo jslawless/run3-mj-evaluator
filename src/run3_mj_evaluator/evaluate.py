@@ -373,19 +373,47 @@ def prepare_comb_input(pt, eta, phi, e, px, py, pz, mask):
     return input_norm, input_raw, spher_7jet, top7_idx
 
 
+def _onnx_fixed_batch(session):
+    """Return a comb_solver's pinned batch size, or None if the batch axis is dynamic.
+
+    A correctly exported model declares a dynamic batch axis and accepts any
+    number of events per call. Some exports instead bake the trace's batch size
+    into the output/internal shapes (e.g. a torch ``.view(..., 1, ...)`` capturing
+    batch=1): the model then only works at that exact batch and trips an internal
+    Reshape for anything larger ('gemm_input_reshape' ... input {7, B, 256} vs
+    requested {7, 256}). Read the output's leading dim — an int means the batch
+    is pinned to that value; a string/None means it is dynamic.
+    """
+    out_shape = session.get_outputs()[0].shape  # [1, 70] (pinned) or ['batch', 70]
+    lead = out_shape[0] if out_shape else None
+    return lead if isinstance(lead, int) else None
+
+
 def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
     """Run the CombinatorialSolver in batches.
 
-    The exported ONNX has a dynamic batch axis (input ['batch', 7, 4]), so we
-    can score many events per session.run call. Chunking — rather than one
+    A correctly exported ONNX has a dynamic batch axis (input ['batch', 7, 4]),
+    so we score many events per session.run call. Chunking — rather than one
     giant call — keeps the 70-assignment expansion cache-friendly and bounds
-    peak memory.
+    peak memory. If the model was exported with a pinned batch size (see
+    _onnx_fixed_batch) we clamp to it so the job doesn't crash on the internal
+    Reshape; a pin of 1 means one session.run per event — correct but slow, so
+    re-export the model with a dynamic batch axis to recover throughput.
 
     model_input : (N, 7, 4) float32
     batch_size  : number of events per session.run call (default 2048)
     Returns t1_idx, t2_idx each (N, 3) int — indices into the 7-jet array.
     """
     N = model_input.shape[0]
+    fixed = _onnx_fixed_batch(session)
+    if fixed is not None and fixed < batch_size:
+        print(
+            f"      NOTE: model output batch is pinned to {fixed}; scoring "
+            f"{fixed} event(s) per call instead of {batch_size} "
+            f"(re-export with a dynamic batch axis for speed).",
+            flush=True,
+        )
+        batch_size = fixed
     best = np.empty(N, dtype=np.int64)
     for i in range(0, N, batch_size):
         (logits,) = session.run(None, {"four_momenta": model_input[i : i + batch_size]})
