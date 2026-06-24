@@ -5,6 +5,12 @@
     "models": [
         {
             "type":         "comb_solver",
+            "path":         "models/ml_model_final_20260609_022205_df34ba8.onnx",
+            "label":        "CombSolverMasym",
+            "normalized": true 
+        },
+        {
+            "type":         "comb_solver",
             "path":         "models/ml_model_final_20260505_165042_5e8067a.onnx",
             "label":        "CombSolver",
             "normalized": true 
