@@ -281,19 +281,15 @@ def chunk_to_numpy(chunk, branch=_JET_BRANCH, min_jets=0):
 # SPANet
 # ---------------------------------------------------------------------------
 
-def _extract_triplets(assignments, progress_desc=None):
+def _extract_triplets(assignments):
     """Argmax over (J, J, J) assignment tensor. assignments: (B, J, J, J) → (B, 3)."""
     B = assignments.shape[0]
-    out = np.zeros((B, 3), dtype=int)
-    iterator = (
-        _progress_iter(B, progress_desc) if progress_desc is not None else range(B)
-    )
-    for b in iterator:
-        out[b] = np.unravel_index(np.argmax(assignments[b]), assignments[b].shape)
-    return out
+    # Explicit flat size: reshape(B, -1) cannot infer the -1 when B == 0.
+    flat = assignments.reshape(B, np.prod(assignments.shape[1:])).argmax(axis=1)
+    return np.stack(np.unravel_index(flat, assignments.shape[1:]), axis=1)
 
 
-def run_spanet(session, source, mask, progress_label=None):
+def run_spanet(session, source, mask):
     """Run a SPANet session on a batch.
 
     source : (N, J, 4) float32
@@ -310,12 +306,7 @@ def run_spanet(session, source, mask, progress_label=None):
         f"      ONNX forward pass done in {_fmt_duration(time.perf_counter() - t_fwd)}",
         flush=True,
     )
-    desc_t1 = f"{progress_label} argmax t1" if progress_label else None
-    desc_t2 = f"{progress_label} argmax t2" if progress_label else None
-    return (
-        _extract_triplets(t1_assign, progress_desc=desc_t1),
-        _extract_triplets(t2_assign, progress_desc=desc_t2),
-    )
+    return _extract_triplets(t1_assign), _extract_triplets(t2_assign)
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +510,7 @@ def _evaluate_collection(
                     f"format={ifmt}, num_jets={n_src}",
                     flush=True,
                 )
-                t1_n, t2_n = run_spanet(session, source, maskn, progress_label=plabel)
+                t1_n, t2_n = run_spanet(session, source, maskn)
                 t1_idx = topn_idx[rows_n, t1_n]
                 t2_idx = topn_idx[rows_n, t2_n]
             elif mtype == "comb_solver":
