@@ -373,20 +373,31 @@ def prepare_comb_input(pt, eta, phi, e, px, py, pz, mask):
     return input_norm, input_raw, spher_7jet, top7_idx
 
 
-def _onnx_fixed_batch(session):
-    """Return a comb_solver's pinned batch size, or None if the batch axis is dynamic.
+_COMB_BATCH_PROBE = {}
 
-    A correctly exported model declares a dynamic batch axis and accepts any
-    number of events per call. Some exports instead bake the trace's batch size
-    into the output/internal shapes (e.g. a torch ``.view(..., 1, ...)`` capturing
-    batch=1): the model then only works at that exact batch and trips an internal
-    Reshape for anything larger ('gemm_input_reshape' ... input {7, B, 256} vs
-    requested {7, 256}). Read the output's leading dim — an int means the batch
-    is pinned to that value; a string/None means it is dynamic.
+
+def _onnx_fixed_batch(session):
+    """Return 1 if a comb_solver session scores only one event per call, else None.
+
+    A batch-pinned export bakes the trace's batch=1 into internal shapes, so it
+    crashes (or silently drops events) for batches > 1 with an internal Reshape
+    ('gemm_input_reshape' ... input {7, B, 256} vs requested {7, 256}). We cannot
+    trust the declared/inferred output shape: onnxruntime reports a pinned [1, N]
+    even for a graph patched to batch (scripts/patch_comb_solver_batch.py), since
+    it constant-folds an internal batch=1. So probe empirically — run a 2-event
+    dummy batch once, cache the verdict per session: 1 means "pinned, score one
+    event at a time", None means "batches fine".
     """
-    out_shape = session.get_outputs()[0].shape  # [1, 70] (pinned) or ['batch', 70]
-    lead = out_shape[0] if out_shape else None
-    return lead if isinstance(lead, int) else None
+    key = id(session)
+    if key not in _COMB_BATCH_PROBE:
+        n_jets = session.get_inputs()[0].shape[1]
+        probe = np.ones((2, n_jets if isinstance(n_jets, int) else 7, 4), dtype=np.float32)
+        try:
+            (out,) = session.run(None, {"four_momenta": probe})
+            _COMB_BATCH_PROBE[key] = None if out.shape[0] == 2 else 1
+        except Exception:
+            _COMB_BATCH_PROBE[key] = 1
+    return _COMB_BATCH_PROBE[key]
 
 
 def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
@@ -408,9 +419,9 @@ def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
     fixed = _onnx_fixed_batch(session)
     if fixed is not None and fixed < batch_size:
         print(
-            f"      NOTE: model output batch is pinned to {fixed}; scoring "
-            f"{fixed} event(s) per call instead of {batch_size} "
-            f"(re-export with a dynamic batch axis for speed).",
+            f"      NOTE: model is batch-pinned; scoring {fixed} event(s) per "
+            f"call instead of {batch_size}. Run scripts/patch_comb_solver_batch.py "
+            f"(or re-export with a dynamic batch axis) for full-batch speed.",
             flush=True,
         )
         batch_size = fixed
@@ -515,7 +526,7 @@ def dalitz_masses_sq(pt, eta, phi, e, indices):
 # ONNX session loader
 # ---------------------------------------------------------------------------
 
-def _load_session(model_path):
+def _load_session(model_path, disabled_optimizers=None):
     # On a Condor slot the cgroup exposes only a subset of the node's cores, so
     # onnxruntime's default (one thread per logical core, pinned via
     # pthread_setaffinity_np) floods the log with affinity errors and
@@ -524,18 +535,25 @@ def _load_session(model_path):
     # ORT_NUM_THREADS / OMP_NUM_THREADS if set, else default to 1 (the
     # comb_solver now batches 2048 events per call, so intra-op parallelism
     # across the batch is worthwhile when multiple cores are available).
+    #
+    # ``disabled_optimizers`` turns off named ORT graph-optimization rewrites.
+    # comb_solver models patched by scripts/patch_comb_solver_batch.py must run
+    # with "MatMulAddFusion" disabled: that fusion folds MatMul+Add -> Gemm and
+    # re-inserts a batch-1 'gemm_input_reshape' that crashes on batches > 1.
     n_threads = int(os.environ.get("ORT_NUM_THREADS")
                     or os.environ.get("OMP_NUM_THREADS")
                     or 1)
     opts = onnxruntime.SessionOptions()
     opts.intra_op_num_threads = n_threads
     opts.inter_op_num_threads = n_threads
+    kwargs = {"disabled_optimizers": list(disabled_optimizers)} if disabled_optimizers else {}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         return onnxruntime.InferenceSession(
             model_path,
             sess_options=opts,
             providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+            **kwargs,
         )
 
 
@@ -726,7 +744,11 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
     load_t0 = time.perf_counter()
     for m in models:
         with _Timer(f"{m['label']} ({m['type']})  <-  {m['path']}"):
-            sess = _load_session(m["path"])
+            # comb_solver graphs may be batch-fixed exports patched for batching
+            # (see patch_comb_solver_batch.py); disable the fusion that would
+            # re-break them. Harmless for already-dynamic comb_solver models.
+            disabled = ["MatMulAddFusion"] if m["type"] == "comb_solver" else None
+            sess = _load_session(m["path"], disabled_optimizers=disabled)
             print(
                 f"    providers used: {sess.get_providers()}",
                 flush=True,

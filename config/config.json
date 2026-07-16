@@ -5,13 +5,13 @@
     "models": [
         {
             "type":         "comb_solver",
-            "path":         "models/ml_model_final_20260609_022205_df34ba8.onnx",
+            "path":         "models/ml_model_final_20260609_022205_df34ba8_batched.onnx",
             "label":        "CombSolverMasym",
             "normalized": true 
         },
         {
             "type":         "comb_solver",
-            "path":         "models/ml_model_final_20260505_165042_5e8067a.onnx",
+            "path":         "models/ml_model_final_20260505_165042_5e8067a_batched.onnx",
             "label":        "CombSolver",
             "normalized": true 
         },
