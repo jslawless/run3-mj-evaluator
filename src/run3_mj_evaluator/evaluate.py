@@ -400,7 +400,7 @@ def _onnx_fixed_batch(session):
     return _COMB_BATCH_PROBE[key]
 
 
-def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
+def run_comb_solver(session, model_input, progress_label=None, batch_size=64):
     """Run the CombinatorialSolver in batches.
 
     A correctly exported ONNX has a dynamic batch axis (input ['batch', 7, 4]),
@@ -411,8 +411,18 @@ def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
     Reshape; a pin of 1 means one session.run per event — correct but slow, so
     re-export the model with a dynamic batch axis to recover throughput.
 
+    The batch must stay SMALL for the models patched by
+    scripts/patch_comb_solver_batch.py: their traced attention does work that
+    scales as (batch x 7)^2 rather than batch x 7^2, so both time and memory
+    blow up with batch size. Measured on ml_model_final_*_batched.onnx: 235 MB
+    at 64, 1.9 GB at 256, 3.4 GB at 1024+, and 110 ms/event at 2048 versus
+    ~30 ms/event at 64 — i.e. a big batch costs gigabytes and is *slower* per
+    event. 2048 put condor jobs over a 4 GB request. A properly re-exported
+    (dynamic_axes) model would not have this scaling and could take a large
+    batch again.
+
     model_input : (N, 7, 4) float32
-    batch_size  : number of events per session.run call (default 2048)
+    batch_size  : number of events per session.run call (default 64)
     Returns t1_idx, t2_idx each (N, 3) int — indices into the 7-jet array.
     """
     N = model_input.shape[0]
@@ -420,8 +430,9 @@ def run_comb_solver(session, model_input, progress_label=None, batch_size=2048):
     if fixed is not None and fixed < batch_size:
         print(
             f"      NOTE: model is batch-pinned; scoring {fixed} event(s) per "
-            f"call instead of {batch_size}. Run scripts/patch_comb_solver_batch.py "
-            f"(or re-export with a dynamic batch axis) for full-batch speed.",
+            f"call instead of {batch_size}. Re-export with a dynamic batch axis "
+            f"for full-batch speed (patch_comb_solver_batch.py only makes the "
+            f"graph shape-correct; it does not make it faster).",
             flush=True,
         )
         batch_size = fixed
@@ -533,8 +544,8 @@ def _load_session(model_path, disabled_optimizers=None):
     # oversubscribes the slot. Pin the thread counts explicitly -- this both
     # silences the affinity calls and matches the requested CPUs. Honour
     # ORT_NUM_THREADS / OMP_NUM_THREADS if set, else default to 1 (the
-    # comb_solver now batches 2048 events per call, so intra-op parallelism
-    # across the batch is worthwhile when multiple cores are available).
+    # comb_solver batches 64 events per call, so intra-op parallelism across
+    # the batch is worth something when multiple cores are available).
     #
     # ``disabled_optimizers`` turns off named ORT graph-optimization rewrites.
     # comb_solver models patched by scripts/patch_comb_solver_batch.py must run
