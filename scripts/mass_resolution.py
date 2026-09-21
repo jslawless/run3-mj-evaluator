@@ -94,6 +94,22 @@ The input is one slimmed ROOT file, several, or a JSON listing them - either
 the slimmer/evaluator fileset layout (``{dataset: {"files": {path: tree}}}``)
 or the analyzer's dataset layout (``{"datasets": {name: [paths]}}``).
 
+Output is a ROOT file of histograms plus a PDF beside it (``--plot`` to place
+it elsewhere, ``--no-plot`` to skip): page 1 overlays every model against the
+random baseline and the two truth floors, page 2 the ten fixed partitions, and
+the rest are per-method panels with the fitted Gaussian drawn over the
+histogram. Every curve is labelled with its fitted mass, width and accuracy.
+
+matplotlib is imported lazily and is **not** a dependency of this repo - the
+evaluator wheel is pip-installed on every condor worker and has no reason to
+carry it. If it is missing the run still completes and writes the ROOT file;
+make the PDF afterwards, from an environment that has matplotlib, with::
+
+    python scripts/mass_resolution.py --plot-from mass_resolution_M1000.root
+
+which re-reads the histograms and fit parameters out of the output file and
+needs neither onnxruntime nor the input data.
+
 ``--exactly-six`` restricts to 6-jet events, where every method is choosing
 from the same six jets and the comparison is strictly like-for-like. Without
 it the models use their production pools (7 or 8 jets) while the Comb methods
@@ -118,17 +134,11 @@ import uproot
 # Make the package importable without `pip install -e .` (src/ layout).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from run3_mj_evaluator.evaluate import (  # noqa: E402
-    _label_to_prefix,
-    _load_session,
-    candidate_fourvec,
-    chunk_to_numpy,
-    load_config,
-    mass_asymmetry,
-    prepare_comb_input,
-    run_comb_solver,
-    run_spanet,
-)
+# NOTE: run3_mj_evaluator.evaluate is imported inside main(), not here. It
+# imports onnxruntime at module scope, and --plot-from has to run in an
+# environment that has matplotlib but not necessarily onnxruntime - which is
+# the normal situation, since the evaluator wheel deliberately ships neither
+# matplotlib nor a plotting step to the condor workers.
 
 #: Pythia status of the outgoing partons of the hard subprocess - the three
 #: quarks the gluino decays to carry it. Same convention as the analyzer's
@@ -500,6 +510,163 @@ def gaussian_fit(counts, edges, mu0, sigma0, nsigma=2.0, iters=8, min_bins=5):
 
 
 # ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+
+def _fit_label(label, fit, acc):
+    """Legend text: the method, its fitted peak and width, and its accuracy."""
+    if fit and np.isfinite(fit.get("mu", np.nan)):
+        star = "" if fit.get("converged") else "*"
+        core = f"m={fit['mu']:.0f}{star}, $\\sigma$={fit['sigma']:.0f}"
+        if fit["mu"]:
+            core += f" ({100 * fit['sigma'] / fit['mu']:.0f}%)"
+    else:
+        core = "no fit"
+    return f"{label} — {core}" + (f", acc={acc}" if acc else "")
+
+
+def make_plots(entries, pdf_path, mass_range, title=None):
+    """Write the multi-page PDF. ``entries`` is a list of plot-ready dicts.
+
+    matplotlib is imported here, not at module scope: the evaluator wheel is
+    pip-installed on every condor worker, and plotting is an interactive step
+    that no batch job needs, so it must not become a hard dependency. A missing
+    matplotlib costs you the PDF and nothing else.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")          # write files; never needs a display
+        import matplotlib.pyplot as plt
+        from matplotlib.backends.backend_pdf import PdfPages
+    except ImportError:
+        print("\n[plot] matplotlib is not installed in this environment, so no "
+              "PDF was written.\n       Install it (pkg-env/bin/pip install "
+              "matplotlib), or re-make the plot\n       from the ROOT file with "
+              "an environment that has it:\n"
+              "         python scripts/mass_resolution.py --plot-from "
+              f"{pdf_path.with_suffix('.root')}")
+        return False
+
+    combs = [e for e in entries if e["key"].startswith("Comb")
+             and e["key"] != "CombRandom"]
+    headline = [e for e in entries if e not in combs]
+
+    def draw(ax, group, density=True):
+        for e in group:
+            values, edges = e["values"], e["edges"]
+            total = values.sum()
+            if total <= 0:
+                continue
+            y = values / (total * np.diff(edges)) if density else values
+            style = {}
+            if e["key"] == "TruthScoutingJet":
+                style = {"color": "k", "linewidth": 2.0}
+            elif e["key"] == "TruthGenJet":
+                style = {"color": "k", "linewidth": 2.0, "linestyle": "--"}
+            ax.stairs(y, edges, label=_fit_label(e["label"], e["fit"], e["acc"]),
+                      **style)
+        ax.set_xlim(*mass_range)
+        ax.set_xlabel("average tri-jet candidate mass [GeV]")
+        ax.set_ylabel("a.u. (unit area)" if density else "events")
+        ax.legend(fontsize=7.5, loc="upper right")
+
+    with PdfPages(pdf_path) as pdf:
+        # Page 1 - the comparison that matters: every model against the
+        # random baseline and the two truth floors.
+        fig, ax = plt.subplots(figsize=(9, 5.5))
+        draw(ax, headline)
+        ax.set_title(title or "Mass resolution by assignment method")
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # Page 2 - the ten fixed partitions, i.e. how much of the spread is
+        # pure combinatorics.
+        if combs:
+            fig, ax = plt.subplots(figsize=(9, 5.5))
+            draw(ax, combs)
+            ax.set_title("The 10 six-jet partitions")
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+        # Page 3+ - one panel per method, raw counts with the fitted Gaussian
+        # drawn on top. This is where a bad fit is visible rather than merely
+        # flagged, so it is plotted in counts, the space the fit ran in.
+        per_page = 9
+        for start in range(0, len(entries), per_page):
+            group = entries[start:start + per_page]
+            fig, axes = plt.subplots(3, 3, figsize=(12, 9))
+            for ax, e in zip(axes.flat, group):
+                values, edges = e["values"], e["edges"]
+                ax.stairs(values, edges, color="C0")
+                fit = e["fit"]
+                if fit and np.isfinite(fit.get("mu", np.nan)):
+                    x = np.linspace(edges[0], edges[-1], 400)
+                    ax.plot(x, fit["amp"] * np.exp(
+                        -((x - fit["mu"]) ** 2) / (2 * fit["sigma"] ** 2)),
+                        "r-", linewidth=1.2)
+                    ax.axvline(fit["mu"], color="r", linestyle=":", linewidth=0.8)
+                    note = f"m={fit['mu']:.0f}\n$\\sigma$={fit['sigma']:.0f}"
+                    if not fit.get("converged"):
+                        note += "\n(no conv.)"
+                else:
+                    note = "no fit"
+                if e["acc"]:
+                    note += f"\nacc={e['acc']}"
+                ax.text(0.03, 0.97, note, transform=ax.transAxes, va="top",
+                        fontsize=7.5)
+                ax.set_title(e["label"], fontsize=9)
+                ax.set_xlim(*mass_range)
+                ax.tick_params(labelsize=7)
+            for ax in axes.flat[len(group):]:
+                ax.axis("off")
+            fig.supxlabel("average tri-jet candidate mass [GeV]", fontsize=9)
+            fig.tight_layout()
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+
+    print(f"plots written to {pdf_path}")
+    return True
+
+
+def entries_from_results(results, n_truth):
+    """Plot-ready dicts straight out of an in-memory run."""
+    out = []
+    for key, res in results.items():
+        acc = ("" if key.startswith("Truth") or not n_truth
+               else f"{100.0 * res.n_correct / n_truth:.1f}%")
+        out.append({
+            "key": key, "label": res.label, "fit": res.fit, "acc": acc,
+            "values": res.hist.view()["value"],
+            "edges": res.hist.axes[0].edges,
+        })
+    return out
+
+
+def entries_from_file(root_path):
+    """Plot-ready dicts read back from a previous run's output file.
+
+    The point of this path is that the environment which can run the ONNX
+    models is not necessarily the one with matplotlib: everything the plot
+    needs - the histograms and the fit parameters - is already in the output
+    file, so the PDF can be made later, elsewhere, without re-running anything.
+    """
+    with uproot.open(root_path) as f:
+        summary = json.loads(str(f["summary"]))
+        n_truth = summary.get("n_truth_matched", 0)
+        out = []
+        for key, meta in summary["methods"].items():
+            h = f[f"h_mass_{key}"].to_boost()
+            acc = ("" if key.startswith("Truth") or not n_truth
+                   else f"{100.0 * meta.get('n_correct', 0) / n_truth:.1f}%")
+            out.append({
+                "key": key, "label": meta.get("label", key),
+                "fit": meta.get("fit"), "acc": acc,
+                "values": h.view()["value"], "edges": h.axes[0].edges,
+            })
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -509,10 +676,12 @@ def main():
                     "models, all 10 six-jet partitions, a random one, and the "
                     "gen-truth assignment."
     )
-    p.add_argument("inputs", nargs="+",
-                   help="slimmed ROOT file(s), or a JSON listing them")
-    p.add_argument("--config", required=True,
-                   help="evaluator config JSON; every model in it is scored")
+    p.add_argument("inputs", nargs="*",
+                   help="slimmed ROOT file(s), or a JSON listing them "
+                   "(not needed with --plot-from)")
+    p.add_argument("--config", default=None,
+                   help="evaluator config JSON; every model in it is scored "
+                   "(not needed with --plot-from)")
     p.add_argument("-o", "--output", default="mass_resolution.root",
                    help="output ROOT file of histograms (default: %(default)s)")
     p.add_argument("--tree", default=None,
@@ -541,9 +710,46 @@ def main():
     p.add_argument("--fit-nsigma", type=float, default=2.0, metavar="N",
                    help="Gaussian fit window, in current sigma either side of "
                    "the peak (default: %(default)s)")
+    p.add_argument("--plot", default=None, metavar="PDF",
+                   help="PDF to write (default: the --output path with a .pdf "
+                   "suffix)")
+    p.add_argument("--no-plot", action="store_true",
+                   help="skip the PDF")
+    p.add_argument("--plot-from", default=None, metavar="ROOT",
+                   help="make the PDF from a previous run's output file and "
+                   "exit - no models are run, so this works in an environment "
+                   "that has matplotlib but not onnxruntime")
     p.add_argument("--write-tree", action="store_true",
                    help="also write a per-event TTree of every method's mass")
     args = p.parse_args()
+
+    # Re-plot an existing run and stop: nothing below this needs to happen, and
+    # requiring --config/inputs for it would defeat the purpose.
+    if args.plot_from:
+        pdf = Path(args.plot or Path(args.plot_from).with_suffix(".pdf"))
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        make_plots(entries_from_file(args.plot_from), pdf,
+                   tuple(args.mass_range), title=Path(args.plot_from).stem)
+        return
+
+    if not args.inputs or not args.config:
+        raise SystemExit(
+            "Both an input and --config are required (or use --plot-from to "
+            "re-plot a previous run)."
+        )
+
+    # Deferred so --plot-from never needs onnxruntime (see the note at the top).
+    from run3_mj_evaluator.evaluate import (  # noqa: PLC0415
+        _label_to_prefix,
+        _load_session,
+        candidate_fourvec,
+        chunk_to_numpy,
+        load_config,
+        mass_asymmetry,
+        prepare_comb_input,
+        run_comb_solver,
+        run_spanet,
+    )
 
     if args.pool_size != 6:
         raise SystemExit(
@@ -893,6 +1099,12 @@ def main():
                  for k, res in results.items()}
             )
     print(f"\nhistograms + summary written to {args.output}")
+
+    if not args.no_plot:
+        pdf = Path(args.plot or Path(args.output).with_suffix(".pdf"))
+        pdf.parent.mkdir(parents=True, exist_ok=True)
+        make_plots(entries_from_results(results, n_truth), pdf,
+                   tuple(args.mass_range), title=Path(args.output).stem)
 
 
 if __name__ == "__main__":
