@@ -120,6 +120,7 @@ jets, so the two modes answer different questions - run both.
 
 import argparse
 import json
+import re
 import sys
 import time
 from itertools import combinations
@@ -367,11 +368,24 @@ class MethodResult:
     It sets the method's own accuracy ceiling: a model that only ever sees the
     leading 7 jets cannot find a truth partition that needs the 8th, so
     accuracy is only interpretable next to ``n_reachable``.
+
+    ``chooser`` is False for rows that are not *picking* an assignment - the
+    truth rows, and the pooled ``AllCombs`` spectrum. Quoting an accuracy for
+    those is meaningless (AllCombs contains the right answer once in every ten
+    entries by construction), so their accuracy columns print "-" rather than
+    a number that invites comparison.
+
+    ``hidden`` keeps a method out of the table and the plots while still
+    accumulating it - the ten individual partitions are computed either way,
+    because their accuracies summing to the reach ceiling is a self-test worth
+    keeping, but they are only shown with ``--split-combs``.
     """
 
-    def __init__(self, label, pool=None):
+    def __init__(self, label, pool=None, chooser=True, hidden=False):
         self.label = label
         self.pool = pool
+        self.chooser = chooser
+        self.hidden = hidden
         self.mass = []          # average candidate mass, per event
         self.response = []      # mass / gluino pole mass
         self.masym = []         # candidate mass asymmetry
@@ -390,6 +404,24 @@ class MethodResult:
             self.n_correct += int(correct.sum())
         if reachable is not None:
             self.n_reachable += int(reachable.sum())
+
+    def add_pooled(self, masses, masyms, m_pole, truth_ok, reachable):
+        """Append several assignments of the same events as one spectrum.
+
+        Used by ``AllCombs``: every event contributes all ten partitions, so
+        the mass arrays are concatenated and ``m_pole``/``truth_ok`` are tiled
+        to match. The event counters are incremented **once**, not once per
+        partition - they count events, and this is still one pass over them.
+        """
+        n_rep = len(masses)
+        pooled = np.concatenate(masses)
+        self.mass.append(pooled)
+        tiled_pole = np.tile(m_pole, n_rep)
+        self.response.append(pooled / np.where(tiled_pole > 0, tiled_pole, np.nan))
+        self.masym.append(np.concatenate(masyms))
+        self.mass_matched.append(np.concatenate([m[truth_ok] for m in masses]))
+        self.n_matched += int(truth_ok.sum())
+        self.n_reachable += int(reachable.sum())
 
     def finalize(self):
         cat = lambda xs: (np.concatenate(xs) if xs else np.empty(0))
@@ -547,9 +579,11 @@ def make_plots(entries, pdf_path, mass_range, title=None):
               f"{pdf_path.with_suffix('.root')}")
         return False
 
-    combs = [e for e in entries if e["key"].startswith("Comb")
-             and e["key"] != "CombRandom"]
-    headline = [e for e in entries if e not in combs]
+    # Only the individually-numbered partitions go on their own page; AllCombs
+    # and CombRandom belong with the methods being compared.
+    is_single_comb = re.compile(r"^Comb\d\d$").match
+    combs = [e for e in entries if is_single_comb(e["key"])]
+    headline = [e for e in entries if not is_single_comb(e["key"])]
 
     def draw(ax, group, density=True):
         for e in group:
@@ -570,21 +604,32 @@ def make_plots(entries, pdf_path, mass_range, title=None):
         ax.set_ylabel("a.u. (unit area)" if density else "events")
         ax.legend(fontsize=7.5, loc="upper right")
 
+    base = title or "Mass resolution by assignment method"
     with PdfPages(pdf_path) as pdf:
-        # Page 1 - the comparison that matters: every model against the
-        # random baseline and the two truth floors.
+        # Page 1 - the comparison that matters, every curve to unit area so
+        # shapes are comparable despite the truth rows covering far fewer
+        # events and AllCombs covering ten times as many.
         fig, ax = plt.subplots(figsize=(9, 5.5))
-        draw(ax, headline)
-        ax.set_title(title or "Mass resolution by assignment method")
+        draw(ax, headline, density=True)
+        ax.set_title(f"{base} — normalized (unit area)")
         pdf.savefig(fig, bbox_inches="tight")
         plt.close(fig)
 
-        # Page 2 - the ten fixed partitions, i.e. how much of the spread is
-        # pure combinatorics.
+        # Page 2 - the same set in raw counts. Normalizing hides how little of
+        # the sample the truth rows actually are, which is the thing that
+        # limits what they can be used to claim.
+        fig, ax = plt.subplots(figsize=(9, 5.5))
+        draw(ax, headline, density=False)
+        ax.set_title(f"{base} — counts")
+        pdf.savefig(fig, bbox_inches="tight")
+        plt.close(fig)
+
+        # Page 3 - the ten fixed partitions, only when --split-combs asked for
+        # them; AllCombs on page 1 is their pooled shape.
         if combs:
             fig, ax = plt.subplots(figsize=(9, 5.5))
             draw(ax, combs)
-            ax.set_title("The 10 six-jet partitions")
+            ax.set_title("The 10 six-jet partitions, individually")
             pdf.savefig(fig, bbox_inches="tight")
             plt.close(fig)
 
@@ -629,10 +674,12 @@ def make_plots(entries, pdf_path, mass_range, title=None):
 
 
 def entries_from_results(results, n_truth):
-    """Plot-ready dicts straight out of an in-memory run."""
+    """Plot-ready dicts straight out of an in-memory run (hidden rows omitted)."""
     out = []
     for key, res in results.items():
-        acc = ("" if key.startswith("Truth") or not n_truth
+        if res.hidden:
+            continue
+        acc = ("" if not res.chooser or not n_truth
                else f"{100.0 * res.n_correct / n_truth:.1f}%")
         out.append({
             "key": key, "label": res.label, "fit": res.fit, "acc": acc,
@@ -655,8 +702,10 @@ def entries_from_file(root_path):
         n_truth = summary.get("n_truth_matched", 0)
         out = []
         for key, meta in summary["methods"].items():
+            if meta.get("hidden"):
+                continue
             h = f[f"h_mass_{key}"].to_boost()
-            acc = ("" if key.startswith("Truth") or not n_truth
+            acc = ("" if not meta.get("chooser", True) or not n_truth
                    else f"{100.0 * meta.get('n_correct', 0) / n_truth:.1f}%")
             out.append({
                 "key": key, "label": meta.get("label", key),
@@ -704,6 +753,10 @@ def main():
                    help="uproot.iterate chunk size (default: %(default)s)")
     p.add_argument("--max-events", type=int, default=None,
                    help="stop after this many events (quick tests)")
+    p.add_argument("--split-combs", action="store_true",
+                   help="also show the ten partitions individually; by default "
+                   "only their pooled AllCombs spectrum is shown (they are "
+                   "always computed, and always written to the ROOT file)")
     p.add_argument("--no-gen-truth", action="store_true",
                    help="skip the GenJet truth method (e.g. an input with no "
                    "GenJet collection)")
@@ -795,15 +848,24 @@ def main():
     for m in models:
         pool = int(m.get("num_jets", 8)) if m["type"] == "spanet" else 7
         results[_label_to_prefix(m["label"])] = MethodResult(m["label"], pool)
+    # The pooled spectrum: every event contributes all ten partitions, so this
+    # is the shape of the unsorted combinatorial background with no choice made
+    # at all. Registered before the individual ones so it leads the table.
+    results["AllCombs"] = MethodResult("AllCombs", args.pool_size, chooser=False)
     for i in range(n_part):
-        results[f"Comb{i:02d}"] = MethodResult(f"Comb{i:02d}", args.pool_size)
+        results[f"Comb{i:02d}"] = MethodResult(
+            f"Comb{i:02d}", args.pool_size, hidden=not args.split_combs
+        )
     results["CombRandom"] = MethodResult("CombRandom", args.pool_size)
-    results["TruthScoutingJet"] = MethodResult("TruthScoutingJet", None)
+    results["TruthScoutingJet"] = MethodResult("TruthScoutingJet", None,
+                                               chooser=False)
     if not args.no_gen_truth:
-        results["TruthGenJet"] = MethodResult("TruthGenJet", None)
+        results["TruthGenJet"] = MethodResult("TruthGenJet", None,
+                                              chooser=False)
 
     rng = np.random.default_rng(args.seed)
     n_seen = n_used = n_truth = n_truth_gen = 0
+    pole_masses = set()   # gluino masses seen, as a sanity check on the input
 
     for path, tree in jobs:
         print(f"[read] {path}  (tree: {tree})", flush=True)
@@ -857,6 +919,8 @@ def main():
                 chunk, eta_pad, phi_pad, valid_pad, args.dr_max
             )
             n_truth += int(truth_ok.sum())
+            finite_pole = m_pole[np.isfinite(m_pole)]
+            pole_masses.update(np.round(np.unique(finite_pole), 1).tolist())
 
             gen_kin = (None if args.no_gen_truth
                        else collection_to_numpy(chunk, "GenJet", min_jets=6))
@@ -890,6 +954,7 @@ def main():
                     m_avg, m_pole, masym,
                     truth_ok, correct, reach_cache[res.pool] & truth_ok,
                 )
+                return m_avg, masym
 
             # --- the config's models, run exactly as evaluate.py runs them ---
             comb_norm, comb_raw, _s7, top7_idx = prepare_comb_input(
@@ -930,6 +995,7 @@ def main():
             pick = rng.integers(0, n_part, size=n_chunk)
             rand_t1 = np.empty((n_chunk, 3), dtype=np.int64)
             rand_t2 = np.empty((n_chunk, 3), dtype=np.int64)
+            comb_masses, comb_masyms = [], []
             for i in range(n_part):
                 t1_idx = pool[rows, g1_table[i][None, :]]
                 t2_idx = pool[rows, g2_table[i][None, :]]
@@ -938,10 +1004,17 @@ def main():
                     same_partition(t1_idx, t2_idx, truth_idx[:, 0], truth_idx[:, 1]),
                     False,
                 )
-                score(t1_idx, t2_idx, f"Comb{i:02d}", correct)
+                m_avg_i, masym_i = score(t1_idx, t2_idx, f"Comb{i:02d}", correct)
+                comb_masses.append(m_avg_i)
+                comb_masyms.append(masym_i)
                 sel = pick == i
                 rand_t1[sel] = t1_idx[sel]
                 rand_t2[sel] = t2_idx[sel]
+
+            results["AllCombs"].add_pooled(
+                comb_masses, comb_masyms, m_pole, truth_ok,
+                truth_in_pool(truth_idx, order, args.pool_size) & truth_ok,
+            )
 
             correct_rand = np.where(
                 truth_ok,
@@ -982,6 +1055,18 @@ def main():
 
     # --- report -----------------------------------------------------------
     print(f"\n{n_used:,} events used of {n_seen:,} read")
+    # The mass point is read from the file rather than passed in, so say
+    # which one was found: a surprise here means the wrong input, and every
+    # response number below is quoted against it.
+    if not pole_masses:
+        print("[warn] no gluino (pdgId 1000021) in the gen record - is this "
+              "the right sample? Response is meaningless without it.")
+    elif len(pole_masses) == 1:
+        print(f"gluino pole mass (from GenPart): {pole_masses.pop():g} GeV")
+    else:
+        print(f"[warn] more than one gluino mass in the input: "
+              f"{sorted(pole_masses)} - mass points are mixed, and the fit "
+              "will straddle them")
     print(f"truth-matched (ScoutingPFJet): {n_truth:,} "
           f"({100 * n_truth / n_used:.1f}%)")
     if not args.no_gen_truth:
@@ -1011,6 +1096,8 @@ def main():
     print(header)
     print("-" * (len(header) - 1))
     for key, res in results.items():
+        if res.hidden:
+            continue
         mass = res.mass[np.isfinite(res.mass)]
         if len(mass) == 0:
             print(f"{res.label:<20}{'(no events)':>10}")
@@ -1031,7 +1118,7 @@ def main():
             fit_r = f"{fit['sigma'] / fit['mu']:.3f}"
         else:
             fit_m = fit_s = fit_r = "-"
-        if key.startswith("Truth"):
+        if not res.chooser:
             acc_s = ceil_s = chance_s = ratio_s = "-"
         else:
             acc_s = f"{100.0 * res.n_correct / n_truth:.1f}%" if n_truth else "-"
@@ -1044,6 +1131,17 @@ def main():
               f"{sig / med:>9.3f}{fit_m:>9}{fit_s:>9}{fit_r:>9}"
               f"{reach:>7.1f}%{acc_s:>8}"
               f"{ceil_s:>11}{chance_s:>8}{ratio_s:>11}")
+    singles = [r for k, r in results.items() if re.match(r"^Comb\d\d$", k)]
+    if singles and n_truth:
+        # Exactly one of the ten partitions is the right one whenever the truth
+        # is reachable, so these accuracies must sum to the reach ceiling. A
+        # mismatch means the enumeration and the truth matching disagree.
+        total = sum(r.n_correct for r in singles)
+        ceiling = singles[0].n_reachable
+        ok = "ok" if abs(total - ceiling) <= 1 else "MISMATCH"
+        print(f"\nself-test: the {len(singles)} partitions' correct counts sum "
+              f"to {total:,} against a reach ceiling of {ceiling:,} [{ok}]")
+
     print("\nsigma_eff = half the central 68% interval, tails included. "
           "'fit m'/'fit sig' are\na Gaussian fitted iteratively over "
           f"+/-{args.fit_nsigma:g} sigma of the peak, so they describe the "
@@ -1077,6 +1175,8 @@ def main():
             key: {
                 "label": res.label,
                 "pool": res.pool,
+                "chooser": res.chooser,
+                "hidden": res.hidden,
                 "n": int(np.isfinite(res.mass).sum()),
                 "median_mass": float(np.median(res.mass[np.isfinite(res.mass)]))
                 if np.isfinite(res.mass).any() else None,
