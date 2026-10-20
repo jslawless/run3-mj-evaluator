@@ -19,7 +19,14 @@
             "type":         "comb_solver",
             "path":         "models/classical_mass_asymmetry_final_20260505_165042_5e8067a.onnx",
             "label":        "Mass Asymmetry",
-            "normalized": true 
+            "normalized": true
+        },
+        {
+            "type":         "comb_solver",
+            "path":         "models/pairnet_gated_7jet_mass_073b06e.onnx",
+            "label":        "PairNet",
+            "normalized":   false,
+            "pairing_output": "logits"
         },
         {
             "type":         "spanet",

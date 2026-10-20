@@ -68,6 +68,9 @@ _VALID_TYPES   = {"spanet", "comb_solver"}
 # the per-feature (x-mean)/std standardization is baked into the ONNX graph (its
 # stats are in log space for pt/e), but the log(x+1) is not, so we apply it here.
 _VALID_FORMATS = {"cart", "spher", "spher_log"}
+# comb_solver pairing_output: which (batch, 70) output is argmax'ed. Legacy
+# CombSolver models only have "logits"; gated PairNet also has "signal_logits".
+_VALID_PAIRING_OUTPUTS = {"logits", "signal_logits"}
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +188,11 @@ def load_config(config_path):
                 )
         if m["type"] == "comb_solver" and "normalized" not in m:
             sys.exit(f"Model {i} (comb_solver) must have 'normalized': true or false.")
+        if m["type"] == "comb_solver" and m.get("pairing_output", "logits") not in _VALID_PAIRING_OUTPUTS:
+            sys.exit(
+                f"Model {i} (comb_solver) 'pairing_output' must be one of "
+                f"{sorted(_VALID_PAIRING_OUTPUTS)}."
+            )
 
     return cfg
 
@@ -393,14 +401,15 @@ def _onnx_fixed_batch(session):
         n_jets = session.get_inputs()[0].shape[1]
         probe = np.ones((2, n_jets if isinstance(n_jets, int) else 7, 4), dtype=np.float32)
         try:
-            (out,) = session.run(None, {"four_momenta": probe})
+            out = session.run(None, {"four_momenta": probe})[0]
             _COMB_BATCH_PROBE[key] = None if out.shape[0] == 2 else 1
         except Exception:
             _COMB_BATCH_PROBE[key] = 1
     return _COMB_BATCH_PROBE[key]
 
 
-def run_comb_solver(session, model_input, progress_label=None, batch_size=64):
+def run_comb_solver(session, model_input, progress_label=None, batch_size=64,
+                    pairing_output="logits", return_extras=False):
     """Run the CombinatorialSolver in batches.
 
     A correctly exported ONNX has a dynamic batch axis (input ['batch', 7, 4]),
@@ -421,11 +430,29 @@ def run_comb_solver(session, model_input, progress_label=None, batch_size=64):
     (dynamic_axes) model would not have this scaling and could take a large
     batch again.
 
-    model_input : (N, 7, 4) float32
-    batch_size  : number of events per session.run call (default 64)
-    Returns t1_idx, t2_idx each (N, 3) int — indices into the 7-jet array.
+    Gated PairNet exports (CombinatorialSolver models/pairnet_gated_7jet*.onnx)
+    take the same input and use the same 70-assignment order, but have extra
+    outputs: logits, p_signal, signal_logits, masses and (mass-head models)
+    m_est. Outputs are fetched by name, so ``pairing_output`` picks which
+    (batch, 70) output is argmax'ed: "logits" (gated mixture, the drop-in) or
+    "signal_logits" (signal scorer alone, meant for use with a p_signal cut).
+
+    model_input    : (N, 7, 4) float32
+    batch_size     : number of events per session.run call (default 64)
+    pairing_output : name of the (batch, 70) output to argmax
+    return_extras  : also return a dict of the per-event scalar outputs the
+                     model has ("p_signal", "m_est"), each (N,) float32
+    Returns t1_idx, t2_idx each (N, 3) int — indices into the 7-jet array
+    (plus the extras dict when return_extras).
     """
     N = model_input.shape[0]
+    out_names = [o.name for o in session.get_outputs()]
+    if pairing_output not in out_names:
+        raise ValueError(
+            f"pairing_output '{pairing_output}' is not an output of this model "
+            f"(outputs: {out_names})"
+        )
+    extra_names = [n for n in ("p_signal", "m_est") if n in out_names] if return_extras else []
     fixed = _onnx_fixed_batch(session)
     if fixed is not None and fixed < batch_size:
         print(
@@ -436,10 +463,16 @@ def run_comb_solver(session, model_input, progress_label=None, batch_size=64):
             flush=True,
         )
         batch_size = fixed
-    best = np.empty(N, dtype=np.int64)
+    best   = np.empty(N, dtype=np.int64)
+    extras = {n: np.empty(N, dtype=np.float32) for n in extra_names}
+    fetch  = [pairing_output] + extra_names
     for i in range(0, N, batch_size):
-        (logits,) = session.run(None, {"four_momenta": model_input[i : i + batch_size]})
+        logits, *rest = session.run(fetch, {"four_momenta": model_input[i : i + batch_size]})
         best[i : i + batch_size] = np.argmax(logits, axis=-1)
+        for n, r in zip(extra_names, rest):
+            extras[n][i : i + batch_size] = r
+    if return_extras:
+        return _COMB_G1[best], _COMB_G2[best], extras
     return _COMB_G1[best], _COMB_G2[best]
 
 
@@ -614,6 +647,7 @@ def _evaluate_collection(
         prefix = _label_to_prefix(model_cfg["label"])
         mtype  = model_cfg["type"]
         plabel = f"{model_cfg['label']}/{label_for_log}"
+        extras = {}
 
         with _Timer(f"Running {model_cfg['label']} ({mtype}) on {label_for_log} jets ({n_chunk:,} events)"):
             if mtype == "spanet":
@@ -646,9 +680,17 @@ def _evaluate_collection(
                     f"normalized={model_cfg['normalized']}",
                     flush=True,
                 )
-                t1_7, t2_7 = run_comb_solver(session, comb_in, progress_label=plabel)
+                t1_7, t2_7, extras = run_comb_solver(
+                    session, comb_in, progress_label=plabel,
+                    pairing_output=model_cfg.get("pairing_output", "logits"),
+                    return_extras=True,
+                )
                 t1_idx = top7_idx[rows7, t1_7]
                 t2_idx = top7_idx[rows7, t2_7]
+                if "m_est" in extras and model_cfg["normalized"]:
+                    # m_est comes out in the input's units; undo the HT
+                    # normalisation of prepare_comb_input to get GeV.
+                    extras["m_est"] = extras["m_est"] * np.where(mask, pt, 0.0).sum(axis=1).clip(min=1e-6)
             #TODO -- Switch to a Triplet class instead -- easier to mantain
             pt1, eta1, phi1, m1 = candidate_fourvec(pt, eta, phi, e, t1_idx)
             pt2, eta2, phi2, m2 = candidate_fourvec(pt, eta, phi, e, t2_idx)
@@ -671,6 +713,11 @@ def _evaluate_collection(
         out[f"{base}mMid"]    = _reg2(np.stack([d1_mid,       d2_mid      ], axis=1).astype(np.float32))
         out[f"{base}mLow"]    = _reg2(np.stack([d1_low,       d2_low      ], axis=1).astype(np.float32))
         out[f"{base}massAsymmetry"] = ak.Array(masym.astype(np.float32))
+        # Gated PairNet only: event-level P(signal) and learned resonance mass (GeV).
+        if "p_signal" in extras:
+            out[f"{base}pSignal"] = ak.Array(extras["p_signal"].astype(np.float32))
+        if "m_est" in extras:
+            out[f"{base}mEst"]    = ak.Array(extras["m_est"].astype(np.float32))
 
     return out
 

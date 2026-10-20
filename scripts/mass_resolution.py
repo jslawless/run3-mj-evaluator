@@ -35,21 +35,19 @@ Methods scored
 
 Truth matching
 --------------
-The RPV signal decays ``go -> u d s`` through lambda''_112, so unlike the
-ttbar matching in ``run3-mj-analyzer/src/run3_mj_analyzer/truth_matching.py``
-there is no intermediate W and no charge handle: **both gluinos have pdgId
-1000021**, because the gluino is a Majorana fermion. Splitting the six quarks
-by the sign of the mother's pdgId - what the ttbar code does with top/antitop -
-silently puts all six in one group here. They are split by **mother index**
-instead: select ``status == 23`` quarks whose mother is a gluino, and group by
-which gluino they point at. On the practice file that gives exactly 6 quarks
-from exactly 2 distinct gluinos in 100.0% of events, so no event is lost at
-this stage.
+Done by ``run3_mj_evaluator.truth_matching``, which is topology-agnostic and
+shared rather than written into this script. ``--decay rpv`` (default) or
+``--decay ttbar`` selects the preset. It groups the hard decay quarks by
+walking each one's mother chain up to the parent resonance and grouping on
+**which parent particle** it reaches, which is what lets one implementation
+serve both the RPV gluino (one step, and both parents share pdgId +1000021
+because the gluino is Majorana, so a charge split cannot work) and ttbar (two
+steps for the light quarks, via the W). See that module for the copy-collapse
+and for the known limitations of the ΔR matching.
 
-Each quark is then matched to its nearest reco jet, and the event counts as
-truth-matched when all six land within ``--dr-max`` of six *distinct* jets.
-That requirement, not the gen record, is what limits the matched sample
-(measured on the practice file, 10,724 events):
+An event counts as truth-matched when all six quarks land within ``--dr-max``
+of six *distinct* jets, and that requirement - not the gen record - is what
+limits the matched sample. Measured on 10,724 RPV M1000 events:
 
     matching pool      all 6 within dR<0.4      ... and distinct jets
     leading 6 jets            35.4%                     23.2%
@@ -57,12 +55,11 @@ That requirement, not the gen record, is what limits the matched sample
     leading 8 jets            56.3%                     42.5%
     all jets                  60.7%                     46.6%
 
-Matching runs against **all** jets by default, since a model's answer is an
-index into the full jet array and the truth has to live in the same space to be
-comparable. The table above is also the reason the accuracy column is quoted
-on the matched subset only: on the other half of the events there is no right
-answer to be had, and averaging over them would just dilute every method
-toward the same number.
+Matching runs against **all** jets, since a model's answer is an index into the
+full jet array and the truth has to live in the same space to be comparable.
+That is also why accuracy is quoted on the matched subset only: on the other
+half of the events there is no right answer to be had, and averaging over them
+would dilute every method toward the same number.
 
 Resolution is quoted against the gluino pole mass read out of the gen record
 (``GenPart_mass`` of the 1000021 - 1000.0 GeV on the practice file), so no mass
@@ -135,21 +132,16 @@ import uproot
 # Make the package importable without `pip install -e .` (src/ layout).
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from run3_mj_evaluator import truth_matching  # noqa: E402
+
 # NOTE: run3_mj_evaluator.evaluate is imported inside main(), not here. It
 # imports onnxruntime at module scope, and --plot-from has to run in an
 # environment that has matplotlib but not necessarily onnxruntime - which is
 # the normal situation, since the evaluator wheel deliberately ships neither
 # matplotlib nor a plotting step to the condor workers.
 
-#: Pythia status of the outgoing partons of the hard subprocess - the three
-#: quarks the gluino decays to carry it. Same convention as the analyzer's
-#: truth_matching.py, which documents why statusFlags is not available in
-#: ScoutingNano.
-HARD_STATUS = 23
-
-#: The gluino. Majorana, so both of them share this pdgId and the two decay
-#: groups can only be told apart by mother index.
-GLUINO_PDGID = 1000021
+#: Topology presets live in the package; --decay selects one by name.
+DECAY_SPECS = {"rpv": truth_matching.RPV_GLUINO, "ttbar": truth_matching.TTBAR}
 
 JET_BRANCHES = ["ScoutingPFJet_pt", "ScoutingPFJet_eta", "ScoutingPFJet_phi",
                 "ScoutingPFJet_m"]
@@ -258,103 +250,6 @@ def collection_to_numpy(chunk, prefix, min_jets=0):
     px, py, pz = pt * np.cos(phi), pt * np.sin(phi), pt * np.sinh(eta)
     e = np.sqrt(px**2 + py**2 + pz**2 + m**2)
     return pt, eta, phi, e, mask
-
-
-def _delta_r(eta1, phi1, eta2, phi2):
-    """ΔR with phi wrapped into (-pi, pi]. Broadcasting is the caller's job."""
-    dphi = np.abs(phi1 - phi2) % (2.0 * np.pi)
-    dphi = np.minimum(dphi, 2.0 * np.pi - dphi)
-    return np.hypot(eta1 - eta2, dphi)
-
-
-def truth_assignment(chunk, jet_eta, jet_phi, jet_valid, dr_max):
-    """Gen-truth jet assignment for an RPV ``go -> qqq`` pair.
-
-    Parameters
-    ----------
-    chunk : awkward.Array
-        One uproot chunk carrying the ``GenPart_*`` branches.
-    jet_eta, jet_phi : (N, J) float
-        Jets in pT-descending order, padded.
-    jet_valid : (N, J) bool
-        True where the padded slot is a real jet.
-    dr_max : float
-        Match radius.
-
-    Returns
-    -------
-    idx : (N, 2, 3) int
-        Jet indices of the two truth tri-jets (garbage where ``ok`` is False).
-    ok : (N,) bool
-        All six quarks matched to six distinct jets.
-    m_pole : (N,) float
-        Gluino mass from the gen record; NaN if no gluino is present.
-    """
-    pdg = chunk["GenPart_pdgId"]
-    status = chunk["GenPart_status"]
-    mother = chunk["GenPart_genPartIdxMother"]
-
-    # pdgId of each particle's mother; index -1 means "no mother".
-    safe = ak.where(mother < 0, 0, mother)
-    mother_pdg = ak.where(mother < 0, 0, pdg[safe])
-
-    absid = abs(pdg)
-    is_daughter = (
-        (status == HARD_STATUS)
-        & (absid >= 1) & (absid <= 5)
-        & (abs(mother_pdg) == GLUINO_PDGID)
-    )
-
-    n_events = len(pdg)
-    n_found = ak.to_numpy(ak.num(pdg[is_daughter], axis=1))
-
-    def _pad6(arr):
-        return ak.to_numpy(
-            ak.fill_none(ak.pad_none(arr[is_daughter], 6, axis=1, clip=True), 0.0)
-        )
-
-    q_eta = _pad6(chunk["GenPart_eta"])
-    q_phi = _pad6(chunk["GenPart_phi"])
-    q_mother = _pad6(mother).astype(np.int64)
-
-    # Majorana gluino: the two decay groups differ only by which gluino they
-    # point at, so group by mother index. Group 0 is whichever gluino the first
-    # quark in the record came from.
-    group = (q_mother != q_mother[:, :1]).astype(int)
-    balanced = (n_found == 6) & (group.sum(axis=1) == 3)
-
-    # Nearest jet per quark: (N, 6, J) -> (N, 6).
-    dr = _delta_r(q_eta[:, :, None], q_phi[:, :, None],
-                  jet_eta[:, None, :], jet_phi[:, None, :])
-    dr = np.where(jet_valid[:, None, :], dr, np.inf)
-    nearest = dr.argmin(axis=2)
-    nearest_dr = dr.min(axis=2)
-
-    within = (nearest_dr < dr_max).all(axis=1)
-    # Six distinct jets: sorting and differencing is the vectorized way to ask
-    # whether any two quarks grabbed the same jet.
-    ordered = np.sort(nearest, axis=1)
-    distinct = (np.diff(ordered, axis=1) > 0).all(axis=1)
-    ok = balanced & within & distinct
-
-    # Pack into (N, 2, 3) by group. Only meaningful where ok.
-    idx = np.zeros((n_events, 2, 3), dtype=np.int64)
-    if ok.any():
-        rows = np.nonzero(ok)[0]
-        g = group[rows]
-        n = nearest[rows]
-        for slot in (0, 1):
-            sel = g == slot
-            # Exactly three per group where balanced, so the reshape is safe.
-            idx[rows, slot] = n[sel].reshape(len(rows), 3)
-
-    is_gluino = abs(pdg) == GLUINO_PDGID
-    masses = ak.fill_none(
-        ak.pad_none(chunk["GenPart_mass"][is_gluino], 1, axis=1, clip=True), np.nan
-    )
-    m_pole = ak.to_numpy(masses)[:, 0]
-
-    return idx, ok, m_pole
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +636,9 @@ def main():
     p.add_argument("--exactly-six", action="store_true",
                    help="keep only events with exactly 6 jets, so the models "
                    "and the Comb* baselines see the same jets")
+    p.add_argument("--decay", default="rpv", choices=sorted(DECAY_SPECS),
+                   help="topology to truth-match: 'rpv' (go -> qqq) or "
+                   "'ttbar' (t -> b W(-> qq')) (default: %(default)s)")
     p.add_argument("--dr-max", type=float, default=0.4, metavar="R",
                    help="quark-jet match radius (default: %(default)s)")
     p.add_argument("--seed", type=int, default=0,
@@ -813,6 +711,7 @@ def main():
             "different baseline, not a bigger one."
         )
 
+    spec = DECAY_SPECS[args.decay]
     jobs = resolve_inputs(args.inputs, args.tree)
     cfg = load_config(args.config)
     models = cfg["models"]
@@ -822,7 +721,7 @@ def main():
     print(f"models:  {[m['label'] for m in models]}")
     print(f"pool:    leading {args.pool_size} jets for the Comb* baselines"
           + ("  |  restricted to exactly-6-jet events" if args.exactly_six else ""))
-    print(f"match:   dR < {args.dr_max} to all jets\n")
+    print(f"match:   {spec.label}, dR < {args.dr_max} to all jets\n")
 
     print("loading ONNX sessions...")
     sessions = []
@@ -915,9 +814,11 @@ def main():
                 print(f"  [warn] {width} jets in an event exceeds MAX_JETS="
                       f"{MAX_JETS}; the tail is excluded from truth matching")
 
-            truth_idx, truth_ok, m_pole = truth_assignment(
-                chunk, eta_pad, phi_pad, valid_pad, args.dr_max
+            truth_idx, truth_ok = truth_matching.truth_assignment(
+                chunk, eta_pad, phi_pad, valid_pad, spec=spec,
+                dr_max=args.dr_max,
             )
+            m_pole = truth_matching.resonance_mass(chunk, spec=spec)
             n_truth += int(truth_ok.sum())
             finite_pole = m_pole[np.isfinite(m_pole)]
             pole_masses.update(np.round(np.unique(finite_pole), 1).tolist())
@@ -1036,8 +937,8 @@ def main():
             # event. The gap between the two is the reconstruction's share.
             if gen_kin is not None:
                 g_pt, g_eta, g_phi, g_e, g_mask = gen_kin
-                g_idx, g_ok, _ = truth_assignment(
-                    chunk, g_eta, g_phi, g_mask, args.dr_max
+                g_idx, g_ok = truth_matching.truth_assignment(
+                    chunk, g_eta, g_phi, g_mask, spec=spec, dr_max=args.dr_max,
                 )
                 n_truth_gen += int(g_ok.sum())
                 safe_g = np.where(g_ok[:, None, None], g_idx, 0)
@@ -1059,12 +960,12 @@ def main():
     # which one was found: a surprise here means the wrong input, and every
     # response number below is quoted against it.
     if not pole_masses:
-        print("[warn] no gluino (pdgId 1000021) in the gen record - is this "
+        print(f"[warn] no parent {spec.parent_pdgids} in the gen record - is this "
               "the right sample? Response is meaningless without it.")
     elif len(pole_masses) == 1:
-        print(f"gluino pole mass (from GenPart): {pole_masses.pop():g} GeV")
+        print(f"parent pole mass (from GenPart): {pole_masses.pop():g} GeV")
     else:
-        print(f"[warn] more than one gluino mass in the input: "
+        print(f"[warn] more than one parent mass in the input: "
               f"{sorted(pole_masses)} - mass points are mixed, and the fit "
               "will straddle them")
     print(f"truth-matched (ScoutingPFJet): {n_truth:,} "
@@ -1105,7 +1006,7 @@ def main():
         med = float(np.median(mass))
         sig = sigma_eff(mass)
         pool_s = "all" if res.pool is None else str(res.pool)
-        reach = (100.0 * res.n_reachable / n_truth) if n_truth else float("nan")
+        reach_s = (f"{100.0 * res.n_reachable / n_truth:.1f}%" if n_truth else "-")
         n_assign = n_assignments(res.pool)
         fit = res.fit
         if np.isfinite(fit["mu"]):
@@ -1129,7 +1030,7 @@ def main():
                        if on_reach is not None and n_assign else "-")
         print(f"{res.label:<20}{pool_s:>6}{med:>10.1f}{sig:>11.1f}"
               f"{sig / med:>9.3f}{fit_m:>9}{fit_s:>9}{fit_r:>9}"
-              f"{reach:>7.1f}%{acc_s:>8}"
+              f"{reach_s:>8}{acc_s:>8}"
               f"{ceil_s:>11}{chance_s:>8}{ratio_s:>11}")
     singles = [r for k, r in results.items() if re.match(r"^Comb\d\d$", k)]
     if singles and n_truth:

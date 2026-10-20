@@ -57,6 +57,13 @@ python evaluate.py mc.root output.root config.json --run-on-genjets
 | `spanet` | SPANet ONNX model — batched inference, takes `(N, J, 4)` source + `(N, J)` mask | `input_format`: `"cart"` (px,py,pz,e) or `"spher"` (pt,eta,phi,e) |
 | `comb_solver` | CombinatorialSolver ONNX — run one event at a time (batch=1 baked into graph), takes top-7 pT jets as `(1, 7, 4)` (E,px,py,pz) | `normalized`: `true` (divide by HT) or `false` (raw units) |
 
+Gated PairNet exports from CombinatorialSolver (`pairnet_gated_7jet*.onnx`) also
+use `"type": "comb_solver"`: same `(N, 7, 4)` input and 70-assignment order,
+dynamic batch. Their pairings and `p_signal` are scale-invariant, so
+`normalized` can be either. The optional `pairing_output` key picks the output
+to argmax: `"logits"` (default, the gated drop-in) or `"signal_logits"` (signal
+scorer alone, meant for use with a `p_signal` cut).
+
 ## Output ROOT file structure
 
 ### `events` TTree
@@ -73,6 +80,9 @@ each model in the config:
 | `{label}Candidate_jetIdx0[2]` | int32 | Index of 1st assigned jet in `ScoutingPFJet_*` arrays |
 | `{label}Candidate_jetIdx1[2]` | int32 | Index of 2nd assigned jet |
 | `{label}Candidate_jetIdx2[2]` | int32 | Index of 3rd assigned jet |
+| `{label}Candidate_massAsymmetry` | float32 | \|m1 − m2\| / \|m1 + m2\| (one per event) |
+| `{label}Candidate_pSignal` | float32 | Gated PairNet only: event-level P(signal) (one per event) |
+| `{label}Candidate_mEst` | float32 | Mass-head PairNet only: learned resonance mass [GeV] (one per event) |
 
 Each array has two elements per event: `[0]` = candidate 1, `[1]` = candidate 2.
 The jet indices point into the per-event `ScoutingPFJet_*` arrays so you can
