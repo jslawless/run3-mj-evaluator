@@ -72,6 +72,8 @@ __all__ = [
     "DecaySpec",
     "RPV_GLUINO",
     "TTBAR",
+    "match_quarks",
+    "within_distinct",
     "truth_assignment",
     "resonance_mass",
 ]
@@ -196,6 +198,106 @@ def _earliest_copy(idx, pdg, mother, max_walk=MAX_WALK):
     return out
 
 
+def match_quarks(
+    chunk,
+    jet_eta,
+    jet_phi,
+    jet_valid,
+    spec=RPV_GLUINO,
+    hard_status=HARD_STATUS,
+    prefix="GenPart",
+):
+    """Per-quark detail behind ``truth_assignment``, before any ``dr_max`` cut.
+
+    Selects the hard decay quarks, groups them by parent, and finds each one's
+    nearest jet. Nothing here depends on the match radius, so a caller scanning
+    ``dr_max`` (or studying the quarks that fail it) can run this once and cut
+    afterwards; ``truth_assignment`` is exactly this plus the radius and
+    distinct-jet requirements.
+
+    Parameters are as for ``truth_assignment``.
+
+    Returns
+    -------
+    dict of
+        pt, eta : (N, n_quarks) float
+            Quark kinematics, in parent-grouped order: quarks ``[0:n_prongs]``
+            share one parent, the next ``n_prongs`` the next, and so on.
+        jet : (N, n_quarks) int
+            Index of each quark's nearest valid jet (meaningless if none).
+        dr : (N, n_quarks) float
+            ΔR to that jet; ``inf`` when the event has no valid jet.
+        balanced : (N,) bool
+            The gen record yielded exactly ``n_parents`` groups of
+            ``n_prongs`` quarks. Where False the other arrays are padding.
+    """
+    pdg, status, mother, eta, phi = _gen_arrays(
+        chunk, prefix, ("pdgId", "status", "genPartIdxMother", "eta", "phi")
+    )
+    # pT is reported, never used for matching, so a record without it still matches.
+    if f"{prefix}_pt" in ak.fields(chunk):
+        (pt,) = _gen_arrays(chunk, prefix, ("pt",))
+    else:
+        pt = np.full(pdg.shape, np.nan)
+    n_events = pdg.shape[0]
+    n_quarks, n_prongs, n_parents = spec.n_quarks, spec.n_prongs, spec.n_parents
+
+    ancestor = _earliest_copy(
+        _walk_to_parent(pdg, mother, spec.parent_pdgids), pdg, mother
+    )
+
+    is_quark = np.isin(np.abs(pdg), np.asarray(QUARK_ABS_PDGIDS))
+    selected = (status == hard_status) & is_quark & (ancestor >= 0)
+
+    # Gather the selected quarks into a fixed (N, n_quarks) block. Events with
+    # the wrong number are rejected via `balanced` below; the gather is padded
+    # so the array shape is static either way.
+    n_found = selected.sum(axis=1)
+    order = np.argsort(~selected, axis=1, kind="stable")  # selected first
+    take = order[:, :n_quarks]
+    rows = np.arange(n_events)[:, None]
+    q_pt = pt[rows, take]
+    q_eta = eta[rows, take]
+    q_phi = phi[rows, take]
+    q_anc = np.where(selected[rows, take], ancestor[rows, take], -1)
+
+    # Nearest jet per quark: (N, n_quarks, J) -> (N, n_quarks).
+    dr = np.hypot(
+        q_eta[:, :, None] - jet_eta[:, None, :],
+        _wrap_phi(q_phi[:, :, None] - jet_phi[:, None, :]),
+    )
+    dr = np.where(jet_valid[:, None, :], dr, np.inf)
+    nearest = dr.argmin(axis=2)
+    nearest_dr = dr.min(axis=2)
+
+    # Sort each event's quarks by ancestor index, so a parent's prongs land in
+    # one contiguous block and the parent ordering is reproducible.
+    anc_order = np.argsort(q_anc, axis=1, kind="stable")
+    anc_sorted = np.take_along_axis(q_anc, anc_order, axis=1)
+
+    def by_parent(a):
+        return np.take_along_axis(a, anc_order, axis=1)
+
+    blocks = anc_sorted.reshape(n_events, n_parents, n_prongs)
+    # Every prong in a block shares one ancestor, and the blocks differ.
+    same_within = (blocks == blocks[:, :, :1]).all(axis=2).all(axis=1)
+    distinct_blocks = np.ones(n_events, dtype=bool)
+    for b in range(1, n_parents):
+        distinct_blocks &= blocks[:, b, 0] != blocks[:, b - 1, 0]
+
+    balanced = (n_found == n_quarks) & same_within & distinct_blocks & (
+        anc_sorted >= 0
+    ).all(axis=1)
+
+    return {
+        "pt": by_parent(q_pt),
+        "eta": by_parent(q_eta),
+        "jet": by_parent(nearest),
+        "dr": by_parent(nearest_dr),
+        "balanced": balanced,
+    }
+
+
 def truth_assignment(
     chunk,
     jet_eta,
@@ -234,63 +336,23 @@ def truth_assignment(
     ok : (N,) bool
         Every quark matched, within ``dr_max``, to a distinct jet.
     """
-    pdg, status, mother, eta, phi = _gen_arrays(
-        chunk, prefix, ("pdgId", "status", "genPartIdxMother", "eta", "phi")
-    )
-    n_events = pdg.shape[0]
-    n_quarks, n_prongs, n_parents = spec.n_quarks, spec.n_prongs, spec.n_parents
-
-    ancestor = _earliest_copy(
-        _walk_to_parent(pdg, mother, spec.parent_pdgids), pdg, mother
-    )
-
-    is_quark = np.isin(np.abs(pdg), np.asarray(QUARK_ABS_PDGIDS))
-    selected = (status == hard_status) & is_quark & (ancestor >= 0)
-
-    # Gather the selected quarks into a fixed (N, n_quarks) block. Events with
-    # the wrong number are rejected via `balanced` below; the gather is padded
-    # so the array shape is static either way.
-    n_found = selected.sum(axis=1)
-    order = np.argsort(~selected, axis=1, kind="stable")  # selected first
-    take = order[:, :n_quarks]
-    rows = np.arange(n_events)[:, None]
-    q_eta = eta[rows, take]
-    q_phi = phi[rows, take]
-    q_anc = np.where(selected[rows, take], ancestor[rows, take], -1)
-
-    # Nearest jet per quark: (N, n_quarks, J) -> (N, n_quarks).
-    dr = np.hypot(
-        q_eta[:, :, None] - jet_eta[:, None, :],
-        _wrap_phi(q_phi[:, :, None] - jet_phi[:, None, :]),
-    )
-    dr = np.where(jet_valid[:, None, :], dr, np.inf)
-    nearest = dr.argmin(axis=2)
-    nearest_dr = dr.min(axis=2)
-
-    # Sort each event's quarks by ancestor index, so a parent's prongs land in
-    # one contiguous block and the parent ordering is reproducible.
-    anc_order = np.argsort(q_anc, axis=1, kind="stable")
-    anc_sorted = np.take_along_axis(q_anc, anc_order, axis=1)
-    jet_sorted = np.take_along_axis(nearest, anc_order, axis=1)
-
-    blocks = anc_sorted.reshape(n_events, n_parents, n_prongs)
-    # Every prong in a block shares one ancestor, and the blocks differ.
-    same_within = (blocks == blocks[:, :, :1]).all(axis=2).all(axis=1)
-    distinct_blocks = np.ones(n_events, dtype=bool)
-    for b in range(1, n_parents):
-        distinct_blocks &= blocks[:, b, 0] != blocks[:, b - 1, 0]
-
-    balanced = (n_found == n_quarks) & same_within & distinct_blocks & (
-        anc_sorted >= 0
-    ).all(axis=1)
-
-    within = (nearest_dr < dr_max).all(axis=1)
-    ordered = np.sort(nearest, axis=1)
-    distinct_jets = (np.diff(ordered, axis=1) > 0).all(axis=1)
-
-    ok = balanced & within & distinct_jets
-    idx = jet_sorted.reshape(n_events, n_parents, n_prongs)
+    q = match_quarks(chunk, jet_eta, jet_phi, jet_valid, spec=spec,
+                     hard_status=hard_status, prefix=prefix)
+    ok = q["balanced"] & within_distinct(q, dr_max)
+    idx = q["jet"].reshape(len(ok), spec.n_parents, spec.n_prongs)
     return idx, ok
+
+
+def within_distinct(q, dr_max):
+    """Per event: every quark within ``dr_max`` of its jet, all jets distinct.
+
+    ``q`` is a ``match_quarks`` result; combine with ``q["balanced"]`` to get
+    ``truth_assignment``'s ``ok``.
+    """
+    within = (q["dr"] < dr_max).all(axis=1)
+    ordered = np.sort(q["jet"], axis=1)
+    distinct_jets = (np.diff(ordered, axis=1) > 0).all(axis=1)
+    return within & distinct_jets
 
 
 def resonance_mass(chunk, spec=RPV_GLUINO, prefix="GenPart"):
