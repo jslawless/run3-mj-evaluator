@@ -6,13 +6,13 @@
         {
             "type":         "comb_solver",
             "path":         "models/ml_model_final_20260609_022205_df34ba8_batched.onnx",
-            "label":        "CombSolverMasym",
+            "label":        "CombSolverV2",
             "normalized": true 
         },
         {
             "type":         "comb_solver",
             "path":         "models/ml_model_final_20260505_165042_5e8067a_batched.onnx",
-            "label":        "CombSolver",
+            "label":        "CombSolverV1",
             "normalized": true 
         },
         {
@@ -24,7 +24,7 @@
         {
             "type":         "comb_solver",
             "path":         "models/pairnet_gated_7jet_mass_073b06e.onnx",
-            "label":        "PairNet",
+            "label":        "PairNetV0.9",
             "normalized":   false,
             "pairing_output": "logits"
         },
