@@ -348,37 +348,50 @@ def _build_7jet_assignment_tables():
 _COMB_G1, _COMB_G2 = _build_7jet_assignment_tables()  # each (70, 3)
 
 
-def prepare_comb_input(pt, eta, phi, e, px, py, pz, mask):
-    """Select top-7 pT jets and build (N, 7, 4) inputs for CombinatorialSolver.
+def prepare_comb_input(pt, eta, phi, e, px, py, pz, mask, n_jets=7):
+    """Select the top-``n_jets`` pT jets and build (N, n_jets, 4) inputs for
+    CombinatorialSolver.
+
+    ``n_jets`` is the model's input width (``comb_solver_num_jets``): 7 for the
+    original models, 12 for PairNet's 12-jet-context export. Every comb_solver
+    pairs only the leading 7 - the 70 assignments index slots 0-6 - so the
+    first 7 columns of ``top_idx`` are the ones the assignments decode into.
+    The padded jet arrays must be at least ``n_jets`` wide.
 
     Returns
     -------
-    input_norm : (N, 7, 4) float32  — HT-normalised (E, px, py, pz) for the ML model
-    input_raw  : (N, 7, 4) float32  — physical units for the classical solver
-    spher_7jet : (N, 7, 4) float64  — (pt, eta, phi, e) in original units
-    top7_idx   : (N, 7) int         — positions in the original J-jet array
+    input_norm : (N, n_jets, 4) float32  — HT-normalised (E, px, py, pz) for the ML model
+    input_raw  : (N, n_jets, 4) float32  — physical units for the classical solver
+    spher      : (N, n_jets, 4) float64  — (pt, eta, phi, e) in original units
+    top_idx    : (N, n_jets) int         — positions in the original J-jet array
     """
     N = pt.shape[0]
     ht = np.where(mask, pt, 0.0).sum(axis=1, keepdims=True).clip(min=1e-6)
 
     pt_masked = np.where(mask, pt, -np.inf)
-    top7_idx  = np.argsort(-pt_masked, axis=1)[:, :7]  # (N, 7)
+    top_idx   = np.argsort(-pt_masked, axis=1)[:, :n_jets]  # (N, n_jets)
 
     rows = np.arange(N)[:, None]
-    e7   = e  [rows, top7_idx]
-    px7  = px [rows, top7_idx]
-    py7  = py [rows, top7_idx]
-    pz7  = pz [rows, top7_idx]
-    pt7  = pt [rows, top7_idx]
-    eta7 = eta[rows, top7_idx]
-    phi7 = phi[rows, top7_idx]
+    # Slots beyond an event's jet count are padding: zero them explicitly so
+    # models that mask on pT > 0 (PairNet) see them as absent.
+    valid = mask[rows, top_idx]
+    en, pxn, pyn, pzn, ptn, etan, phin = (
+        np.where(valid, a[rows, top_idx], 0.0) for a in (e, px, py, pz, pt, eta, phi)
+    )
 
-    epxpypz    = np.stack([e7, px7, py7, pz7], axis=-1)
+    epxpypz    = np.stack([en, pxn, pyn, pzn], axis=-1)
     input_norm = (epxpypz / ht[:, :, None]).astype(np.float32)
     input_raw  = epxpypz.astype(np.float32)
-    spher_7jet = np.stack([pt7, eta7, phi7, e7], axis=-1)
+    spher      = np.stack([ptn, etan, phin, en], axis=-1)
 
-    return input_norm, input_raw, spher_7jet, top7_idx
+    return input_norm, input_raw, spher, top_idx
+
+
+def comb_solver_num_jets(session):
+    """Jets a comb_solver ONNX takes, from its input shape (batch, J, 4); 7 if
+    the jet axis is not a fixed integer."""
+    j = session.get_inputs()[0].shape[1]
+    return j if isinstance(j, int) else 7
 
 
 _COMB_BATCH_PROBE = {}
@@ -617,9 +630,9 @@ def _evaluate_collection(
     """
     n_chunk = pt.shape[0]
 
-    comb_norm, comb_raw, _spher_7j, top7_idx = prepare_comb_input(
-        pt, eta, phi, e, px, py, pz, mask
-    )
+    # comb_solver inputs, built once per input width (7 or 12 jets) and shared
+    # by every model of that width.
+    comb_inputs = {}
     rows7 = np.arange(n_chunk)[:, None]
 
     # SPANet jet count is baked into each exported model (its attention reshape
@@ -674,6 +687,12 @@ def _evaluate_collection(
                 t1_idx = topn_idx[rows_n, t1_n]
                 t2_idx = topn_idx[rows_n, t2_n]
             elif mtype == "comb_solver":
+                n_in = comb_solver_num_jets(session)
+                if n_in not in comb_inputs:
+                    comb_inputs[n_in] = prepare_comb_input(
+                        pt, eta, phi, e, px, py, pz, mask, n_jets=n_in
+                    )
+                comb_norm, comb_raw, _spher, top_idx = comb_inputs[n_in]
                 comb_in = comb_norm if model_cfg["normalized"] else comb_raw
                 print(
                     f"      input shape {comb_in.shape} ({comb_in.dtype}), "
@@ -685,8 +704,9 @@ def _evaluate_collection(
                     pairing_output=model_cfg.get("pairing_output", "logits"),
                     return_extras=True,
                 )
-                t1_idx = top7_idx[rows7, t1_7]
-                t2_idx = top7_idx[rows7, t2_7]
+                # Assignments index the leading 7 slots of the input.
+                t1_idx = top_idx[rows7, t1_7]
+                t2_idx = top_idx[rows7, t2_7]
                 if "m_est" in extras and model_cfg["normalized"]:
                     # m_est comes out in the input's units; undo the HT
                     # normalisation of prepare_comb_input to get GeV.
@@ -774,12 +794,6 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
     models  = config["models"]
     version = config.get("metadata", {}).get("version", "unknown")
 
-    # Pad jet arrays wide enough for the most jet-hungry model: CombSolver needs
-    # top-7, each SPANet needs its baked-in num_jets (default 8).
-    pad_width = max(
-        [7] + [int(m.get("num_jets", 8)) for m in models if m["type"] == "spanet"]
-    )
-
     try:
         in_size = os.path.getsize(input_path)
         in_size_str = f"{in_size / (1024**2):.1f} MiB"
@@ -814,6 +828,16 @@ def evaluate(input_path, output_path, config, config_path, in_tree_name, chunk_s
             sessions.append(sess)
     print(f"  All {len(sessions)} session(s) loaded in "
           f"{_fmt_duration(time.perf_counter() - load_t0)}.")
+
+    # Pad jet arrays wide enough for the most jet-hungry model: each comb_solver
+    # takes the width of its ONNX input (7, or 12 for PairNet's 12-jet export),
+    # each SPANet its baked-in num_jets (default 8).
+    pad_width = max(
+        [7]
+        + [comb_solver_num_jets(s) for m, s in zip(models, sessions) if m["type"] == "comb_solver"]
+        + [int(m.get("num_jets", 8)) for m in models if m["type"] == "spanet"]
+    )
+    print(f"  Jet arrays padded to {pad_width} slots.")
     print()
 
     with uproot.open(input_path) as in_file:

@@ -59,7 +59,9 @@ python evaluate.py mc.root output.root config.json --run-on-genjets
 
 Gated PairNet exports from CombinatorialSolver (`pairnet_gated_7jet*.onnx`) also
 use `"type": "comb_solver"`: same `(N, 7, 4)` input and 70-assignment order,
-dynamic batch. Their pairings and `p_signal` are scale-invariant, so
+dynamic batch. A comb_solver's input width is read from its ONNX input
+(e.g. `pairnet_gated_12jet_*` takes the leading 12 jets as context but, like
+every comb_solver, pairs only the leading 7). Their pairings and `p_signal` are scale-invariant, so
 `normalized` can be either. The optional `pairing_output` key picks the output
 to argmax: `"logits"` (default, the gated drop-in) or `"signal_logits"` (signal
 scorer alone, meant for use with a `p_signal` cut).

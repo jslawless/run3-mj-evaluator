@@ -695,6 +695,7 @@ def main():
         _load_session,
         candidate_fourvec,
         chunk_to_numpy,
+        comb_solver_num_jets,
         load_config,
         mass_asymmetry,
         prepare_comb_input,
@@ -736,6 +737,8 @@ def main():
     # regardless of the multiplicities it happens to contain.
     min_width = max(
         [7, args.pool_size]
+        + [comb_solver_num_jets(s) for m, s in zip(models, sessions)
+           if m["type"] == "comb_solver"]
         + [int(m.get("num_jets", 8)) for m in models if m["type"] == "spanet"]
     )
 
@@ -858,9 +861,7 @@ def main():
                 return m_avg, masym
 
             # --- the config's models, run exactly as evaluate.py runs them ---
-            comb_norm, comb_raw, _s7, top7_idx = prepare_comb_input(
-                pt, eta, phi, e, px, py, pz, mask
-            )
+            comb_inputs = {}  # per comb_solver input width (7 or 12 jets)
             for model_cfg, session in zip(models, sessions):
                 if model_cfg["type"] == "spanet":
                     n_src = int(model_cfg.get("num_jets", 8))
@@ -881,10 +882,19 @@ def main():
                     t1_idx = idx_n[rows_n, t1_n]
                     t2_idx = idx_n[rows_n, t2_n]
                 else:
+                    n_in = comb_solver_num_jets(session)
+                    if n_in not in comb_inputs:
+                        comb_inputs[n_in] = prepare_comb_input(
+                            pt, eta, phi, e, px, py, pz, mask, n_jets=n_in
+                        )
+                    comb_norm, comb_raw, _s, top_idx = comb_inputs[n_in]
                     comb_in = comb_norm if model_cfg["normalized"] else comb_raw
-                    t1_7, t2_7 = run_comb_solver(session, comb_in)
-                    t1_idx = top7_idx[rows, t1_7]
-                    t2_idx = top7_idx[rows, t2_7]
+                    t1_7, t2_7 = run_comb_solver(
+                        session, comb_in,
+                        pairing_output=model_cfg.get("pairing_output", "logits"),
+                    )
+                    t1_idx = top_idx[rows, t1_7]
+                    t2_idx = top_idx[rows, t2_7]
                 correct = np.where(
                     truth_ok,
                     same_partition(t1_idx, t2_idx, truth_idx[:, 0], truth_idx[:, 1]),
