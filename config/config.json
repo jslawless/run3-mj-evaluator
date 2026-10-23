@@ -36,6 +36,13 @@
             "pairing_output": "logits"
         },
         {
+            "type":         "comb_solver",
+            "path":         "models/pairnet_gated_12jet_win5_lowmass_boost_r14A.onnx",
+            "label":        "PairnetV1",
+            "normalized":   false,
+            "pairing_output": "logits"
+        },
+        {
             "type":         "spanet",
             "path":         "models/spanet.onnx",
             "label":        "SPANet",
